@@ -307,6 +307,112 @@ var checks = []check{
 		out, _ := exec.Command("docker", "ps", "-aq", "--filter", "label="+docker.Label).Output()
 		return err == nil && len(bytes.TrimSpace(out)) == 0, fmt.Sprintf("err=%v leftover=%q", err, out)
 	}},
+	{"firewall-check", func() (bool, string) {
+		err := docker.CheckFirewall(context.Background(), cfg)
+		return err == nil, fmt.Sprintf("err=%v", err)
+	}},
+	{"registry-and-ref-restrictions", func() (bool, string) {
+		var notes []string
+		ok := true
+		for _, img := range []string{"localhost:5000/x", "10.0.0.1/x", "169.254.169.254/x", "ghcr.io:443/a/b", "evil.example.com/x"} {
+			r := run(img, "true", nil, nil, time.Minute)
+			if r.err == nil {
+				ok = false
+			}
+			notes = append(notes, fmt.Sprintf("%s -> %v", img, r.err))
+		}
+		return ok, strings.Join(notes, "\n")
+	}},
+	{"build-exit-125-is-build-status", func() (bool, string) {
+		r := run("golang:1.25", "exit 125", nil, nil, time.Minute)
+		return r.err == nil && r.out.ExitCode == 125, r.String()
+	}},
+	{"log-streams-while-running", func() (bool, string) {
+		dir, _ := os.MkdirTemp("", "runnercheck-")
+		defer os.RemoveAll(dir)
+		w := &firstWrite{}
+		start := time.Now()
+		_, err := docker.Run(context.Background(), cfg, build.Spec{
+			ID: fmt.Sprintf("%x", time.Now().UnixNano()), Image: "golang:1.25",
+			Command: "echo early; sleep 8; echo late", Timeout: time.Minute, Dir: dir,
+		}, w)
+		total := time.Since(start)
+		first := w.at.Sub(start)
+		return err == nil && !w.at.IsZero() && total-first > 6*time.Second && strings.Contains(w.buf.String(), "late"),
+			fmt.Sprintf("err=%v first output after %s, total %s\n%s", err, first, total, w.buf.String())
+	}},
+	{"nonroot-user-image", func() (bool, string) {
+		if out, err := dockerBuild("jbi-nonroot-test", "FROM golang:1.25\nRUN useradd -m bob\nUSER bob\n"); err != nil {
+			return false, out
+		}
+		r := run("jbi-nonroot-test", "id -u; cat in.txt; touch made && echo WROTE-WORK", map[string]string{"in.txt": "SRC-OK\n"}, []string{"made"}, time.Minute)
+		ok := r.err == nil && r.out.ExitCode == 0 && strings.Contains(r.log, "SRC-OK") && strings.Contains(r.log, "WROTE-WORK") && r.arts["./made"] != nil
+		return ok, r.String()
+	}},
+	{"volume-is-memory-tmpfs", func() (bool, string) {
+		if out, err := dockerBuild("jbi-volume-test", "FROM golang:1.25\nVOLUME /data\n"); err != nil {
+			return false, out
+		}
+		vols := func() int {
+			out, _ := exec.Command("docker", "volume", "ls", "-q").Output()
+			return len(strings.Fields(string(out)))
+		}
+		volsBefore := vols()
+		before := usedBytes("/var/lib/docker")
+		r := run("jbi-volume-test", "mount | grep ' /data '; dd if=/dev/zero of=/data/big bs=1M count=3072 status=none; echo dd=$?; du -sh /data",
+			nil, nil, 5*time.Minute)
+		grew := int64(usedBytes("/var/lib/docker")) - int64(before)
+		ok := r.err == nil && strings.Contains(r.log, "tmpfs") && !strings.Contains(r.log, "dd=0") && grew < 512<<20 && vols() == volsBefore
+		return ok, fmt.Sprintf("host disk grew %d MiB, volumes %d -> %d\n%s", grew>>20, volsBefore, vols(), r)
+	}},
+	{"replaced-tar-sparse-bomb", func() (bool, string) {
+		// The build swaps in a tar that emits a 1 TiB GNU sparse entry.
+		start := time.Now()
+		r := run("golang:1.25", `cp bomb.tgz /bomb.tgz
+printf '#!/bin/sh\ncat /bomb.tgz\n' > /usr/bin/tar; chmod +x /usr/bin/tar; touch x`,
+			map[string]string{"bomb.tgz": string(sparseBomb())}, []string{"x"}, time.Minute)
+		took := time.Since(start)
+		ok := r.err == nil && !r.out.TimedOut && len(r.arts) == 0 && strings.Contains(r.log, "sparse file")
+		return ok, fmt.Sprintf("took %s %s", took.Round(time.Millisecond), r)
+	}},
+	{"replaced-tar-real-sparse-file", func() (bool, string) {
+		// GNU tar --sparse on a 20 GB hole: either rejected or cut off
+		// promptly by the timeout.
+		start := time.Now()
+		r := run("golang:1.25", `mv /usr/bin/tar /usr/bin/realtar
+printf '#!/bin/sh\ntruncate -s 20G /big\nexec realtar --sparse -czf - -C / big\n' > /usr/bin/tar
+chmod +x /usr/bin/tar; touch x`, nil, []string{"x"}, 45*time.Second)
+		took := time.Since(start)
+		ok := r.err == nil && len(r.arts) == 0 && took < 75*time.Second
+		return ok, fmt.Sprintf("took %s %s", took.Round(time.Millisecond), r)
+	}},
+	{"replaced-tar-endless-stream-times-out", func() (bool, string) {
+		start := time.Now()
+		r := run("golang:1.25", `printf '#!/bin/sh\nprintf x\nexec sleep 100000\n' > /usr/bin/tar; chmod +x /usr/bin/tar; touch x`,
+			nil, []string{"x"}, 15*time.Second)
+		took := time.Since(start)
+		out, _ := exec.Command("docker", "ps", "-aq", "--filter", "label="+docker.Label).Output()
+		ok := r.err == nil && r.out.TimedOut && took < 60*time.Second && len(r.arts) == 0 && len(bytes.TrimSpace(out)) == 0
+		return ok, fmt.Sprintf("took %s leftover=%q %s", took.Round(time.Millisecond), out, r)
+	}},
+	{"image-size-cap-and-prune", func() (bool, string) {
+		// Pulls busybox twice: once over a 1 MB size cap (must be removed),
+		// then with a 1-byte budget (must prune unused non-catalog images
+		// such as jbi-volume-test, but keep catalog images).
+		exec.Command("docker", "image", "rm", "busybox:1.37").Run()
+		exists := func(ref string) bool { return exec.Command("docker", "image", "inspect", ref).Run() == nil }
+		saved := cfg
+		defer func() { cfg = saved }()
+		cfg.MaxImageBytes = 1e6
+		r1 := run("busybox:1.37", "true", nil, nil, time.Minute)
+		capped := r1.err != nil && strings.Contains(r1.log, "too big") && !exists("busybox:1.37")
+		cfg = saved
+		dockerBuild("jbi-volume-test", "FROM golang:1.25\nVOLUME /data\n")
+		cfg.ImageBudgetBytes = 1
+		r2 := run("busybox:1.37", "echo hi", nil, nil, time.Minute)
+		pruned := r2.err == nil && !exists("jbi-volume-test") && exists("golang:1.25") && exists("busybox:1.37")
+		return capped && pruned, fmt.Sprintf("capped=%v pruned=%v\n%s\n%s", capped, pruned, r1, r2)
+	}},
 	{"toolchain-go-with-deps", func() (bool, string) {
 		r := run("golang:1.25", "go mod init x && go get rsc.io/quote@v1.5.2 && go build -o app . && ./app",
 			map[string]string{"main.go": "package main\n\nimport (\"fmt\"; \"rsc.io/quote\")\n\nfunc main() { fmt.Println(quote.Go()) }\n"},
@@ -370,6 +476,59 @@ func main() {
 		fmt.Printf("%d check(s) failed\n", failed)
 		os.Exit(1)
 	}
+}
+
+// sparseBomb returns a gzipped tar whose one old-GNU sparse entry is 1 byte
+// on the wire and 1 TiB when read.
+func sparseBomb() []byte {
+	b := make([]byte, 512)
+	copy(b[0:], "bomb")
+	copy(b[100:], "0000644\x00")
+	copy(b[108:], "0000000\x00")
+	copy(b[116:], "0000000\x00")
+	copy(b[124:], "00000000001\x00")
+	copy(b[136:], "00000000000\x00")
+	b[156] = tar.TypeGNUSparse
+	copy(b[257:], "ustar  \x00")
+	copy(b[386:], "00000000000\x00") // sparse[0].offset
+	copy(b[398:], "00000000001\x00") // sparse[0].numbytes
+	b[483] = 0x80                    // realsize, base-256
+	for i, v := 494, int64(1<<40); i > 483; i, v = i-1, v>>8 {
+		b[i] = byte(v)
+	}
+	copy(b[148:156], "        ")
+	sum := 0
+	for _, c := range b {
+		sum += int(c)
+	}
+	copy(b[148:], fmt.Sprintf("%06o\x00 ", sum))
+	var buf bytes.Buffer
+	zw := gzip.NewWriter(&buf)
+	zw.Write(b)
+	zw.Write(append([]byte("x"), make([]byte, 511+1024)...))
+	zw.Close()
+	return buf.Bytes()
+}
+
+// firstWrite is a log that records when it was first written to.
+type firstWrite struct {
+	at  time.Time
+	buf bytes.Buffer
+}
+
+func (w *firstWrite) Write(p []byte) (int, error) {
+	if w.at.IsZero() {
+		w.at = time.Now()
+	}
+	return w.buf.Write(p)
+}
+
+// dockerBuild builds a local test image from a Dockerfile.
+func dockerBuild(tag, dockerfile string) (string, error) {
+	cmd := exec.Command("docker", "build", "-q", "-t", tag, "-")
+	cmd.Stdin = strings.NewReader(dockerfile)
+	out, err := cmd.CombinedOutput()
+	return string(out), err
 }
 
 func indent(s string) string {
