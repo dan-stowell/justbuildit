@@ -7,12 +7,14 @@
 #   backed by memory, so writes inside a build count against --memory
 #   instead of filling host disk
 # - creates the `justbuildit` Docker network (bridge jbi0)
-# - adds iptables rules so builds can reach the public internet but not
-#   private ranges, link-local/metadata, or the host itself
+# - installs deploy/firewall.sh (iptables rules so builds can reach the
+#   public internet but not private ranges, link-local/metadata, or the host
+#   itself) with a systemd unit that re-applies it at boot and whenever
+#   Docker starts
 # - pre-pulls the toolchain catalog images
-#
-# The iptables rules are not persisted; re-run this script after a reboot.
 set -euo pipefail
+
+HERE=$(cd "$(dirname "$0")" && pwd)
 
 NETWORK=justbuildit
 BRIDGE=jbi0
@@ -32,6 +34,12 @@ if [[ $EUID -ne 0 ]]; then
 fi
 
 log() { echo "== $*"; }
+
+if ! command -v jq >/dev/null; then
+  log "installing jq"
+  apt-get update -qq
+  apt-get install -y -qq jq
+fi
 
 # --- gVisor -----------------------------------------------------------------
 if ! command -v runsc >/dev/null || ! dpkg -s runsc >/dev/null 2>&1; then
@@ -73,36 +81,25 @@ if ! docker network inspect "$NETWORK" >/dev/null 2>&1; then
 fi
 
 # --- Firewall ---------------------------------------------------------------
-# Forwarded traffic from the build bridge to these destinations is dropped.
-# Builds resolve DNS through public resolvers (the runner passes --dns), so
-# nothing private needs to be reachable.
-log "installing iptables rules"
-BLOCKED=(
-  0.0.0.0/8
-  10.0.0.0/8
-  100.64.0.0/10
-  127.0.0.0/8
-  169.254.0.0/16
-  172.16.0.0/12
-  192.168.0.0/16
-  224.0.0.0/4
-  240.0.0.0/4
-)
-iptables -N JUSTBUILDIT-FWD 2>/dev/null || iptables -F JUSTBUILDIT-FWD
-for cidr in "${BLOCKED[@]}"; do
-  iptables -A JUSTBUILDIT-FWD -d "$cidr" -j DROP
-done
-iptables -A JUSTBUILDIT-FWD -j RETURN
-iptables -C DOCKER-USER -i "$BRIDGE" -j JUSTBUILDIT-FWD 2>/dev/null ||
-  iptables -I DOCKER-USER -i "$BRIDGE" -j JUSTBUILDIT-FWD
+log "installing firewall"
+install -m 755 "$HERE/firewall.sh" /usr/local/sbin/justbuildit-firewall
+cat >/etc/systemd/system/justbuildit-firewall.service <<'UNIT'
+[Unit]
+Description=justbuildit build network firewall
+After=docker.service
+PartOf=docker.service
 
-# Traffic addressed to the host itself (any of its IPs, including the bridge
-# gateway) goes through INPUT, not FORWARD; drop all of it.
-iptables -N JUSTBUILDIT-IN 2>/dev/null || iptables -F JUSTBUILDIT-IN
-iptables -A JUSTBUILDIT-IN -m conntrack --ctstate ESTABLISHED,RELATED -j RETURN
-iptables -A JUSTBUILDIT-IN -j DROP
-iptables -C INPUT -i "$BRIDGE" -j JUSTBUILDIT-IN 2>/dev/null ||
-  iptables -I INPUT -i "$BRIDGE" -j JUSTBUILDIT-IN
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/usr/local/sbin/justbuildit-firewall
+
+[Install]
+WantedBy=docker.service multi-user.target
+UNIT
+systemctl daemon-reload
+systemctl enable justbuildit-firewall.service
+systemctl restart justbuildit-firewall.service
 
 # --- Images -----------------------------------------------------------------
 log "pulling catalog images"
