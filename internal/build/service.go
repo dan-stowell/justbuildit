@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -33,19 +34,50 @@ func (s Status) Done() bool {
 	return s != StatusQueued && s != StatusRunning
 }
 
+// Limits that are not configurable.
+const (
+	// MaxSourceBytes caps a build's workspace: the uploaded tarball, or the
+	// decoded content of files and files_base64.
+	MaxSourceBytes = 50 << 20
+	// MaxSourceFiles caps the number of entries in files plus files_base64.
+	MaxSourceFiles = 10000
+	// MaxPathLen and MaxPathDepth bound each path in files and files_base64.
+	MaxPathLen   = 1024
+	MaxPathDepth = 64
+	// MaxArtifactsBytes caps the artifacts tarball a runner may produce.
+	MaxArtifactsBytes = 500 << 20
+	// MaxLogBytes caps the log kept on disk for each build.
+	MaxLogBytes = 4 << 20
+	// TailLines is the number of log lines in Result.LogTail.
+	TailLines = 200
+
+	defaultTimeout      = 10 * time.Minute
+	maxCommandLen       = 64 << 10
+	maxImageLen         = 256
+	maxArtifactPatterns = 100
+	// maxRetained caps finished builds kept; the oldest are deleted first.
+	maxRetained = 2000
+)
+
+// The errors below are worded for the agents that call the service, so
+// front ends can pass them on as they are.
 var (
-	// ErrNotFound means no such build (or artifact).
-	ErrNotFound = errors.New("not found")
+	// ErrNotFound means no such build.
+	ErrNotFound = errors.New("build not found: the id is unknown, or the build was deleted (builds are kept for a few hours after they finish)")
+	// ErrArtifactNotFound means a build has no such artifact (yet).
+	ErrArtifactNotFound = errors.New("artifact not found: the build is unknown or not finished, or it has no artifact at that path (the build result lists its artifacts)")
 	// ErrQueueFull means the service has too many builds waiting.
-	ErrQueueFull = errors.New("build queue is full; retry later")
+	ErrQueueFull = errors.New("the build queue is full; retry in about 30 seconds")
 	// ErrClientLimit means this client already has too many builds queued or running.
-	ErrClientLimit = errors.New("too many builds queued or running for this client; wait for one to finish")
+	ErrClientLimit = errors.New("too many builds queued or running for this client; wait for one to finish, then retry")
+	// ErrTooLarge means the workspace exceeds MaxSourceBytes.
+	ErrTooLarge = fmt.Errorf("workspace too large: the tarball, or the decoded files and files_base64, may total at most %d MB", MaxSourceBytes>>20)
 )
 
 // InvalidError is a problem with the request itself.
 type InvalidError struct{ Msg string }
 
-func (e *InvalidError) Error() string { return e.Msg }
+func (e *InvalidError) Error() string { return "invalid request: " + e.Msg }
 
 func invalid(format string, args ...any) error {
 	return &InvalidError{Msg: fmt.Sprintf(format, args...)}
@@ -61,8 +93,10 @@ type Request struct {
 	Artifacts      []string          `json:"artifacts,omitempty"`
 	TimeoutSeconds int               `json:"timeout_seconds,omitempty"`
 
-	// Source is a raw gzipped tar of the workspace, used instead of Files.
-	Source []byte `json:"-"`
+	// SourceFile is the path of a gzipped tar of the workspace, used instead
+	// of Files. Submit moves it into the build's directory, so it must be on
+	// the data directory's filesystem; NewUploadFile creates such files.
+	SourceFile string `json:"-"`
 	// Client identifies the caller (an IP address) for per-client limits.
 	Client string `json:"-"`
 }
@@ -85,17 +119,14 @@ type Result struct {
 
 // Config configures a Service. Zero values get defaults.
 type Config struct {
-	DataDir        string
-	Run            RunFunc
-	MaxConcurrent  int           // builds running at once (default 4)
-	MaxQueue       int           // builds waiting to run (default 32)
-	MaxPerClient   int           // builds queued or running per client (default 2)
-	MaxLogBytes    int64         // log size kept on disk (default 10MB)
-	TailLines      int           // lines in Result.LogTail (default 200)
-	DefaultTimeout time.Duration // default build timeout (default 10m)
-	MaxTimeout     time.Duration // max build timeout (default 30m)
-	Retention      time.Duration // how long finished builds are kept (default 6h)
-	Logger         *slog.Logger
+	DataDir       string
+	Run           RunFunc
+	MaxConcurrent int           // builds running at once (default 4)
+	MaxQueue      int           // builds waiting to run (default 32)
+	MaxPerClient  int           // builds queued or running per client (default 2)
+	MaxTimeout    time.Duration // max build timeout (default 30m)
+	Retention     time.Duration // how long finished builds are kept (default 6h)
+	Logger        *slog.Logger
 }
 
 func (c *Config) setDefaults() {
@@ -107,13 +138,6 @@ func (c *Config) setDefaults() {
 	def(&c.MaxConcurrent, 4)
 	def(&c.MaxQueue, 32)
 	def(&c.MaxPerClient, 2)
-	def(&c.TailLines, 200)
-	if c.MaxLogBytes <= 0 {
-		c.MaxLogBytes = 10 << 20
-	}
-	if c.DefaultTimeout <= 0 {
-		c.DefaultTimeout = 10 * time.Minute
-	}
 	if c.MaxTimeout <= 0 {
 		c.MaxTimeout = 30 * time.Minute
 	}
@@ -169,14 +193,19 @@ func New(cfg Config) (*Service, error) {
 	if err := os.MkdirAll(cfg.DataDir, 0o755); err != nil {
 		return nil, err
 	}
-	// The index is in memory, so build directories from a previous run are
-	// unreachable; remove them.
+	// The index is in memory, so build directories and uploads from a
+	// previous run are unreachable; remove them.
 	if entries, err := os.ReadDir(cfg.DataDir); err == nil {
 		for _, e := range entries {
 			if idRE.MatchString(e.Name()) {
 				os.RemoveAll(filepath.Join(cfg.DataDir, e.Name()))
 			}
 		}
+	}
+	uploads := filepath.Join(cfg.DataDir, "uploads")
+	os.RemoveAll(uploads)
+	if err := os.MkdirAll(uploads, 0o755); err != nil {
+		return nil, err
 	}
 	base, stop := context.WithCancel(context.Background())
 	return &Service{
@@ -195,6 +224,16 @@ func (s *Service) Close() { s.stop() }
 // Config returns the effective configuration.
 func (s *Service) Config() Config { return s.cfg }
 
+// DefaultTimeout is the build timeout used when a request gives none.
+func (s *Service) DefaultTimeout() time.Duration { return min(defaultTimeout, s.cfg.MaxTimeout) }
+
+// NewUploadFile creates a temporary file in the data directory, for a request
+// body that may become Request.SourceFile. The caller removes it if Submit
+// does not take it.
+func (s *Service) NewUploadFile() (*os.File, error) {
+	return os.CreateTemp(filepath.Join(s.cfg.DataDir, "uploads"), "body-*")
+}
+
 var idRE = regexp.MustCompile(`^[0-9a-f]{32}$`)
 
 func newID() string {
@@ -210,36 +249,51 @@ func (s *Service) Submit(req Request) (string, error) {
 	if strings.TrimSpace(req.Command) == "" {
 		return "", invalid("command is required (it runs with sh -c in /work)")
 	}
+	if len(req.Command) > maxCommandLen {
+		return "", invalid("command is longer than %d KB; put long scripts in a file in the workspace", maxCommandLen>>10)
+	}
+	if len(req.Image) > maxImageLen {
+		return "", invalid("image is longer than %d characters", maxImageLen)
+	}
 	image, err := ResolveImage(req.Image, req.Toolchain)
 	if err != nil {
 		return "", invalid("%v", err)
 	}
-	timeout := s.cfg.DefaultTimeout
+	timeout := s.DefaultTimeout()
 	if req.TimeoutSeconds < 0 {
 		return "", invalid("timeout_seconds must be positive")
 	}
 	if req.TimeoutSeconds > 0 {
-		timeout = time.Duration(req.TimeoutSeconds) * time.Second
-		if timeout > s.cfg.MaxTimeout {
+		if req.TimeoutSeconds > int(s.cfg.MaxTimeout/time.Second) {
 			return "", invalid("timeout_seconds %d exceeds the maximum of %d", req.TimeoutSeconds, int(s.cfg.MaxTimeout/time.Second))
 		}
+		timeout = time.Duration(req.TimeoutSeconds) * time.Second
+	}
+	if len(req.Artifacts) > maxArtifactPatterns {
+		return "", invalid("at most %d artifact patterns are allowed", maxArtifactPatterns)
 	}
 	var globs []string
 	for _, g := range req.Artifacts {
+		if len(g) > MaxPathLen {
+			return "", invalid("artifact pattern is longer than %d characters", MaxPathLen)
+		}
 		c, err := CleanPath(strings.TrimPrefix(g, "./"))
 		if err != nil {
 			return "", invalid("artifact pattern: %v", err)
 		}
 		globs = append(globs, c)
 	}
-	source := req.Source
-	if len(req.Files) > 0 || len(req.FilesBase64) > 0 {
-		if len(source) > 0 {
+	hasFiles := len(req.Files) > 0 || len(req.FilesBase64) > 0
+	if req.SourceFile != "" {
+		if hasFiles {
 			return "", invalid("send either files or a tarball body, not both")
 		}
-		source, err = TarFromFiles(req.Files, req.FilesBase64)
+		fi, err := os.Stat(req.SourceFile)
 		if err != nil {
-			return "", invalid("%v", err)
+			return "", err
+		}
+		if fi.Size() > MaxSourceBytes {
+			return "", ErrTooLarge
 		}
 	}
 
@@ -257,30 +311,83 @@ func (s *Service) Submit(req Request) (string, error) {
 		ID:        j.id,
 		Image:     image,
 		Command:   req.Command,
-		Source:    source,
 		Artifacts: globs,
 		Timeout:   timeout,
 		Dir:       filepath.Join(j.root, "work"),
 	}
+	if req.SourceFile != "" || hasFiles {
+		spec.SourceFile = filepath.Join(j.root, "source.tar.gz")
+	}
 
+	// Reserve the queue and client slots before the (possibly slow) work of
+	// writing the source.
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	if s.queued >= s.cfg.MaxQueue {
+		s.mu.Unlock()
 		return "", ErrQueueFull
 	}
 	if s.clients[req.Client] >= s.cfg.MaxPerClient {
+		s.mu.Unlock()
 		return "", ErrClientLimit
 	}
-	logFile, err := s.prepare(j, spec)
-	if err != nil {
-		os.RemoveAll(j.root)
-		return "", err
-	}
-	s.jobs[j.id] = j
 	s.queued++
 	s.clients[req.Client]++
+	s.mu.Unlock()
+
+	logFile, err := s.prepare(j, spec, req)
+	if err != nil {
+		os.RemoveAll(j.root)
+		s.mu.Lock()
+		s.queued--
+		s.releaseClient(j.client)
+		s.mu.Unlock()
+		return "", err
+	}
+	s.mu.Lock()
+	s.jobs[j.id] = j
+	s.mu.Unlock()
 	go s.run(j, spec, logFile)
 	return j.id, nil
+}
+
+// releaseClient drops one queued or running build from a client's count.
+// It is called with s.mu held.
+func (s *Service) releaseClient(client string) {
+	s.clients[client]--
+	if s.clients[client] <= 0 {
+		delete(s.clients, client)
+	}
+}
+
+// prepare creates the build's directories, source tarball and log file.
+func (s *Service) prepare(j *job, spec Spec, req Request) (*os.File, error) {
+	if err := os.MkdirAll(spec.Dir, 0o755); err != nil {
+		return nil, err
+	}
+	switch {
+	case req.SourceFile != "":
+		if err := os.Rename(req.SourceFile, spec.SourceFile); err != nil {
+			return nil, err
+		}
+	case spec.SourceFile != "":
+		f, err := os.Create(spec.SourceFile)
+		if err != nil {
+			return nil, err
+		}
+		err = TarFromFiles(f, req.Files, req.FilesBase64)
+		if cerr := f.Close(); err == nil {
+			err = cerr
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	f, err := os.Create(filepath.Join(j.root, "build.log"))
+	if err != nil {
+		return nil, err
+	}
+	j.log = newLogWriter(f, MaxLogBytes)
+	return f, nil
 }
 
 func (s *Service) run(j *job, spec Spec, logFile *os.File) {
@@ -302,20 +409,13 @@ func (s *Service) run(j *job, spec Spec, logFile *os.File) {
 	s.mu.Unlock()
 
 	if runErr == nil {
-		// The runner enforces spec.Timeout; this is a backstop.
-		ctx, cancel := context.WithTimeout(s.base, spec.Timeout+2*time.Minute)
-		outcome, runErr = s.cfg.Run(ctx, spec, j.log)
-		cancel()
+		outcome, runErr = s.execute(spec, j.log)
 		<-s.sem
 	}
 	logFile.Close()
 	var arts []Artifact
 	if runErr == nil {
-		var err error
-		arts, err = ListArtifacts(filepath.Join(spec.Dir, ArtifactsFile))
-		if err != nil {
-			s.cfg.Logger.Warn("listing artifacts", "build", j.id, "err", err)
-		}
+		arts, runErr = s.listArtifacts(spec)
 	}
 
 	s.mu.Lock()
@@ -329,7 +429,7 @@ func (s *Service) run(j *job, spec Spec, logFile *os.File) {
 	case runErr != nil:
 		j.status = StatusError
 		j.err = runErr.Error()
-		s.cfg.Logger.Error("build infrastructure error", "build", j.id, "err", runErr)
+		s.cfg.Logger.Error("build error", "build", j.id, "err", runErr)
 	case outcome.TimedOut:
 		j.status = StatusTimedOut
 	case outcome.ExitCode == 0:
@@ -337,26 +437,79 @@ func (s *Service) run(j *job, spec Spec, logFile *os.File) {
 	default:
 		j.status = StatusFailed
 	}
-	s.clients[j.client]--
-	if s.clients[j.client] <= 0 {
-		delete(s.clients, j.client)
-	}
+	s.releaseClient(j.client)
+	evicted := s.evictLocked()
 	s.mu.Unlock()
 	close(j.done)
+	if evicted != nil {
+		s.remove(evicted)
+	}
 }
 
-// prepare creates the build's directories and log file. It is called with
-// s.mu held; creating a couple of directories is cheap enough.
-func (s *Service) prepare(j *job, spec Spec) (*os.File, error) {
-	if err := os.MkdirAll(spec.Dir, 0o755); err != nil {
-		return nil, err
+// execute calls the RunFunc, turning a panic into an error so the build's
+// slots are still released.
+func (s *Service) execute(spec Spec, log io.Writer) (o Outcome, err error) {
+	// The runner enforces spec.Timeout; this is a backstop.
+	ctx, cancel := context.WithTimeout(s.base, spec.Timeout+2*time.Minute)
+	defer cancel()
+	defer func() {
+		if r := recover(); r != nil {
+			s.cfg.Logger.Error("build runner panicked", "build", spec.ID, "panic", r, "stack", string(debug.Stack()))
+			o, err = Outcome{}, fmt.Errorf("internal error: the build runner crashed: %v", r)
+		}
+	}()
+	return s.cfg.Run(ctx, spec, log)
+}
+
+// listArtifacts lists a finished build's artifacts. An oversized tarball is
+// deleted and reported as an error.
+func (s *Service) listArtifacts(spec Spec) ([]Artifact, error) {
+	p := filepath.Join(spec.Dir, ArtifactsFile)
+	fi, err := os.Stat(p)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
 	}
-	f, err := os.Create(filepath.Join(j.root, "build.log"))
 	if err != nil {
 		return nil, err
 	}
-	j.log = newLogWriter(f, s.cfg.MaxLogBytes)
-	return f, nil
+	if fi.Size() > MaxArtifactsBytes {
+		os.Remove(p)
+		return nil, fmt.Errorf("the artifacts are %d MB compressed, over the %d MB limit; use narrower artifact patterns", fi.Size()>>20, MaxArtifactsBytes>>20)
+	}
+	arts, err := ListArtifacts(p)
+	if err != nil {
+		s.cfg.Logger.Warn("listing artifacts", "build", spec.ID, "err", err)
+	}
+	return arts, nil
+}
+
+// evictLocked drops the oldest finished build from the index when more than
+// maxRetained are kept, and returns it so the caller can delete its files.
+// It is called with s.mu held.
+func (s *Service) evictLocked() *job {
+	var (
+		n      int
+		oldest *job
+	)
+	for _, j := range s.jobs {
+		if j.status.Done() {
+			n++
+			if oldest == nil || j.finished.Before(oldest.finished) {
+				oldest = j
+			}
+		}
+	}
+	if n <= maxRetained {
+		return nil
+	}
+	delete(s.jobs, oldest.id)
+	return oldest
+}
+
+func (s *Service) remove(j *job) {
+	if err := os.RemoveAll(j.root); err != nil {
+		s.cfg.Logger.Warn("removing build", "build", j.id, "err", err)
+	}
 }
 
 // Build submits req and waits up to wait for it to finish.
@@ -420,7 +573,7 @@ func (s *Service) result(j *job) Result {
 	lw := j.log
 	s.mu.Unlock()
 	if lw != nil {
-		r.LogTail = lw.Tail(s.cfg.TailLines)
+		r.LogTail = lw.Tail(TailLines)
 	}
 	return r
 }
@@ -435,20 +588,20 @@ func (s *Service) LogPath(id string) (string, error) {
 }
 
 // ArtifactsPath returns the path of a finished build's artifacts tarball, or
-// ErrNotFound if the build is unknown, unfinished, or has no artifacts.
+// ErrArtifactNotFound if the build is unknown, unfinished, or has no artifacts.
 func (s *Service) ArtifactsPath(id string) (string, error) {
 	j := s.lookup(id)
 	if j == nil {
-		return "", ErrNotFound
+		return "", ErrArtifactNotFound
 	}
 	select {
 	case <-j.done:
 	default:
-		return "", ErrNotFound
+		return "", ErrArtifactNotFound
 	}
 	p := filepath.Join(j.root, "work", ArtifactsFile)
 	if _, err := os.Stat(p); err != nil {
-		return "", ErrNotFound
+		return "", ErrArtifactNotFound
 	}
 	return p, nil
 }
@@ -475,9 +628,7 @@ func (s *Service) Sweep(now time.Time) {
 	}
 	s.mu.Unlock()
 	for _, j := range old {
-		if err := os.RemoveAll(j.root); err != nil {
-			s.cfg.Logger.Warn("removing build", "build", j.id, "err", err)
-		}
+		s.remove(j)
 	}
 }
 

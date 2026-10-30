@@ -10,13 +10,13 @@ import (
 
 // Spec is everything a runner needs to execute one build.
 type Spec struct {
-	ID        string        // 128-bit random hex
-	Image     string        // resolved docker image ref
-	Command   string        // run with `sh -c` in /work
-	Source    []byte        // gzipped tar of the workspace (may be empty)
-	Artifacts []string      // glob patterns relative to /work
-	Timeout   time.Duration // kill the build after this long
-	Dir       string        // host dir owned by the runner for this build
+	ID         string        // 128-bit random hex
+	Image      string        // resolved docker image ref
+	Command    string        // run with `sh -c` in /work
+	SourceFile string        // host path of a gzipped tar of the workspace (outside Dir), or "" if none
+	Artifacts  []string      // glob patterns relative to /work
+	Timeout    time.Duration // kill the build after this long
+	Dir        string        // host dir owned by the runner for this build
 }
 
 // Outcome is the result of a build that the runner managed to execute.

@@ -24,16 +24,15 @@ var run build.RunFunc = func(ctx context.Context, spec build.Spec, log io.Writer
 
 func main() {
 	var (
-		addr        = flag.String("addr", ":8000", "listen address")
-		dataDir     = flag.String("data-dir", "/var/lib/justbuildit", "directory for build logs and artifacts")
-		publicURL   = flag.String("public-url", "", "externally visible base URL (default: derived from each request)")
-		ipHeader    = flag.String("client-ip-header", "", "header set by a trusted proxy holding the client IP, e.g. X-Forwarded-For")
-		concurrent  = flag.Int("max-concurrent", 4, "builds running at once")
-		queue       = flag.Int("max-queue", 32, "builds waiting to run")
-		perClient   = flag.Int("max-per-client", 2, "builds queued or running per client IP")
-		maxTimeout  = flag.Duration("max-timeout", 30*time.Minute, "maximum build timeout")
-		retention   = flag.Duration("retention", 6*time.Hour, "how long finished builds are kept")
-		maxUploadMB = flag.Int64("max-upload-mb", 50, "request upload limit in MB")
+		addr       = flag.String("addr", ":8000", "listen address")
+		dataDir    = flag.String("data-dir", "/var/lib/justbuildit", "directory for build logs and artifacts")
+		publicURL  = flag.String("public-url", "", "externally visible base URL (default: derived from each request)")
+		ipHeader   = flag.String("client-ip-header", "", "header set by a trusted proxy holding the client IP, e.g. X-Forwarded-For")
+		concurrent = flag.Int("max-concurrent", 4, "builds running at once")
+		queue      = flag.Int("max-queue", 32, "builds waiting to run")
+		perClient  = flag.Int("max-per-client", 2, "builds queued or running per client IP")
+		maxTimeout = flag.Duration("max-timeout", 30*time.Minute, "maximum build timeout")
+		retention  = flag.Duration("retention", 6*time.Hour, "how long finished builds are kept")
 	)
 	flag.Parse()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
@@ -64,7 +63,6 @@ func main() {
 			Service:        svc,
 			PublicURL:      *publicURL,
 			ClientIPHeader: *ipHeader,
-			MaxUploadBytes: *maxUploadMB << 20,
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}

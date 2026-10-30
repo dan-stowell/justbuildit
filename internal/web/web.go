@@ -10,17 +10,53 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"net/netip"
+	"net/url"
 	"os"
 	"path"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dan-stowell/justbuildit/internal/build"
-	"golang.org/x/time/rate"
 )
 
-// Options configures the web server. Zero values get defaults.
+const (
+	// defaultBuildWait and maxWait bound how long REST calls wait for a build.
+	defaultBuildWait = 45 * time.Second
+	maxWait          = 600 * time.Second
+	// maxMCPWait bounds MCP waits, since MCP clients often time out tool
+	// calls after about 60s.
+	maxMCPWait = 50 * time.Second
+
+	// maxBody caps request bodies, allowing for JSON and base64 overhead on
+	// top of the workspace limit, which is enforced on the decoded content.
+	maxBody = build.MaxSourceBytes*4/3 + 1<<20
+	// uploadTimeout bounds reading a request body.
+	uploadTimeout = 2 * time.Minute
+	// maxUploads bounds request bodies being read and decoded at once.
+	maxUploads = 8
+	// smallMCPBody is the size up to which an MCP request skips the upload
+	// limit.
+	smallMCPBody = 1 << 20
+
+	// maxWaiters and maxWaitersPerClient bound requests waiting on builds.
+	maxWaiters          = 512
+	maxWaitersPerClient = 16
+	// maxArtifactReads bounds artifact downloads at once.
+	maxArtifactReads = 8
+	// maxInlineArtifact is the largest artifact read_artifact returns inline.
+	maxInlineArtifact = 256 << 10
+)
+
+var (
+	errTooManyWaiters = errors.New("too many requests are waiting on builds (from this client or overall); retry in a few seconds, or poll with a shorter wait_seconds")
+	errArtifactsBusy  = errors.New("too many artifact downloads in progress; retry in a few seconds")
+	errBodyTooLarge   = fmt.Errorf("request body too large; the workspace may total at most %d MB", build.MaxSourceBytes>>20)
+)
+
+// Options configures the web server.
 type Options struct {
 	Service *build.Service
 	// PublicURL is the externally visible base URL (e.g.
@@ -29,26 +65,19 @@ type Options struct {
 	// ClientIPHeader, if set, names a header (like X-Forwarded-For) set by a
 	// trusted proxy; its last entry is used as the client IP.
 	ClientIPHeader string
-	// MaxUploadBytes caps request bodies (default 50MB).
-	MaxUploadBytes int64
-	// SubmitRate and SubmitBurst limit build submissions per client
-	// (default 1 per 6s, burst 10).
-	SubmitRate  rate.Limit
-	SubmitBurst int
-	// DefaultWait and MaxWait bound how long POST /v1/builds waits
-	// (default 45s, max 600s). MaxMCPWait bounds MCP waits (default 50s,
-	// since MCP clients often time out tool calls after about 60s).
-	DefaultWait time.Duration
-	MaxWait     time.Duration
-	MaxMCPWait  time.Duration
 }
 
 // Server is the HTTP front end.
 type Server struct {
-	opts    Options
-	svc     *build.Service
-	limiter *limiter
-	mux     *http.ServeMux
+	opts          Options
+	svc           *build.Service
+	mux           *http.ServeMux
+	uploads       chan struct{}
+	artifactReads chan struct{}
+
+	waitMu    sync.Mutex
+	waiting   int
+	waitingBy map[string]int
 }
 
 // Internal headers the server sets on MCP requests (overwriting anything the
@@ -60,30 +89,14 @@ const (
 
 // New returns a Server.
 func New(opts Options) *Server {
-	if opts.MaxUploadBytes <= 0 {
-		opts.MaxUploadBytes = 50 << 20
-	}
-	if opts.SubmitRate <= 0 {
-		opts.SubmitRate = rate.Every(6 * time.Second)
-	}
-	if opts.SubmitBurst <= 0 {
-		opts.SubmitBurst = 10
-	}
-	if opts.DefaultWait <= 0 {
-		opts.DefaultWait = 45 * time.Second
-	}
-	if opts.MaxWait <= 0 {
-		opts.MaxWait = 600 * time.Second
-	}
-	if opts.MaxMCPWait <= 0 {
-		opts.MaxMCPWait = 50 * time.Second
-	}
 	opts.PublicURL = strings.TrimRight(opts.PublicURL, "/")
 	s := &Server{
-		opts:    opts,
-		svc:     opts.Service,
-		limiter: newLimiter(opts.SubmitRate, opts.SubmitBurst),
-		mux:     http.NewServeMux(),
+		opts:          opts,
+		svc:           opts.Service,
+		mux:           http.NewServeMux(),
+		uploads:       make(chan struct{}, maxUploads),
+		artifactReads: make(chan struct{}, maxArtifactReads),
+		waitingBy:     map[string]int{},
 	}
 	s.mux.HandleFunc("GET /{$}", s.handleGuide)
 	s.mux.HandleFunc("GET /llms.txt", s.handleGuide)
@@ -94,9 +107,16 @@ func New(opts Options) *Server {
 	s.mux.HandleFunc("GET /v1/builds/{id}/artifacts/{path...}", s.handleArtifact)
 	mcpHandler := s.mcpHandler()
 	s.mux.Handle("/mcp", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		r.Header.Set(hdrClient, s.clientIP(r))
+		r.Header.Set(hdrClient, s.clientKey(r))
 		r.Header.Set(hdrBaseURL, s.baseURL(r))
-		r.Body = http.MaxBytesReader(w, r.Body, s.maxBody())
+		if r.Method == http.MethodPost {
+			release, err := s.readMCPBody(w, r)
+			if err != nil {
+				writeError(w, err)
+				return
+			}
+			defer release()
+		}
 		mcpHandler.ServeHTTP(w, r)
 	}))
 	return s
@@ -104,23 +124,33 @@ func New(opts Options) *Server {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) { s.mux.ServeHTTP(w, r) }
 
-// maxBody allows for JSON and base64 overhead on top of the upload cap.
-func (s *Server) maxBody() int64 { return s.opts.MaxUploadBytes*4/3 + 1<<20 }
-
-func (s *Server) clientIP(r *http.Request) string {
+// clientKey identifies the client for per-client limits: its IP address, or
+// for IPv6 its /64, since one host commonly has a whole /64.
+func (s *Server) clientKey(r *http.Request) string {
+	ip := ""
 	if h := s.opts.ClientIPHeader; h != "" {
 		if v := r.Header.Values(h); len(v) > 0 {
 			parts := strings.Split(v[len(v)-1], ",")
-			if ip := strings.TrimSpace(parts[len(parts)-1]); ip != "" {
-				return ip
-			}
+			ip = strings.TrimSpace(parts[len(parts)-1])
 		}
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
+	if ip == "" {
+		host, _, err := net.SplitHostPort(r.RemoteAddr)
+		if err != nil {
+			host = r.RemoteAddr
+		}
+		ip = host
 	}
-	return host
+	addr, err := netip.ParseAddr(ip)
+	if err != nil {
+		return ip
+	}
+	addr = addr.Unmap().WithZone("")
+	if addr.Is6() {
+		p, _ := addr.Prefix(64)
+		return p.String()
+	}
+	return addr.String()
 }
 
 func (s *Server) baseURL(r *http.Request) string {
@@ -145,7 +175,11 @@ func decorate(r build.Result, base string) build.Result {
 }
 
 func artifactURL(base, id, p string) string {
-	return base + "/v1/builds/" + id + "/artifacts/" + p
+	segs := strings.Split(p, "/")
+	for i, seg := range segs {
+		segs[i] = url.PathEscape(seg)
+	}
+	return base + "/v1/builds/" + id + "/artifacts/" + strings.Join(segs, "/")
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -156,48 +190,126 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	enc.Encode(v)
 }
 
-func writeError(w http.ResponseWriter, code int, msg string) {
-	writeJSON(w, code, map[string]string{"error": msg})
-}
-
-// writeServiceError maps errors from the build service to HTTP responses.
-func writeServiceError(w http.ResponseWriter, err error) {
+// errorStatus maps an error to an HTTP status. The errors' messages are
+// already worded for the caller.
+func errorStatus(err error) int {
 	var inv *build.InvalidError
 	switch {
 	case errors.As(err, &inv):
-		writeError(w, http.StatusBadRequest, inv.Msg)
-	case errors.Is(err, build.ErrNotFound):
-		writeError(w, http.StatusNotFound, "not found (builds are deleted some hours after they finish)")
-	case errors.Is(err, build.ErrQueueFull), errors.Is(err, build.ErrClientLimit):
+		return http.StatusBadRequest
+	case errors.Is(err, build.ErrNotFound), errors.Is(err, build.ErrArtifactNotFound):
+		return http.StatusNotFound
+	case errors.Is(err, build.ErrTooLarge), errors.Is(err, errBodyTooLarge):
+		return http.StatusRequestEntityTooLarge
+	case errors.Is(err, build.ErrQueueFull), errors.Is(err, build.ErrClientLimit),
+		errors.Is(err, errTooManyWaiters), errors.Is(err, errArtifactsBusy):
+		return http.StatusTooManyRequests
+	}
+	return http.StatusInternalServerError
+}
+
+func writeError(w http.ResponseWriter, err error) {
+	code := errorStatus(err)
+	if code == http.StatusTooManyRequests {
 		w.Header().Set("Retry-After", "30")
-		writeError(w, http.StatusTooManyRequests, err.Error())
-	default:
-		writeError(w, http.StatusInternalServerError, err.Error())
 	}
+	writeJSON(w, code, map[string]string{"error": err.Error()})
 }
 
-func parseWait(v string, def, max time.Duration) (time.Duration, error) {
-	if v == "" {
+func invalidf(format string, args ...any) error {
+	return &build.InvalidError{Msg: fmt.Sprintf(format, args...)}
+}
+
+// waitFor turns an optional wait_seconds into a duration: def when unset,
+// capped at max.
+func waitFor(n *int, def, max time.Duration) (time.Duration, error) {
+	switch {
+	case n == nil:
 		return def, nil
+	case *n < 0:
+		return 0, invalidf("wait_seconds must be non-negative")
+	case *n >= int(max/time.Second):
+		return max, nil
 	}
-	n, err := strconv.Atoi(v)
-	if err != nil || n < 0 {
-		return 0, fmt.Errorf("wait must be a non-negative number of seconds")
-	}
-	return clampWait(n, def, max), nil
+	return time.Duration(*n) * time.Second, nil
 }
 
-// clampWait turns a wait in seconds into a duration capped at max. Zero
-// means def; to not wait at all, callers pass the default as 0.
-func clampWait(n int, def, max time.Duration) time.Duration {
-	d := time.Duration(n) * time.Second
-	if n == 0 {
-		d = def
+// startWait reserves a waiter slot for client if wait is positive. The
+// returned func releases it.
+func (s *Server) startWait(client string, wait time.Duration) (func(), error) {
+	if wait <= 0 {
+		return func() {}, nil
 	}
-	if d > max {
-		d = max
+	s.waitMu.Lock()
+	defer s.waitMu.Unlock()
+	if s.waiting >= maxWaiters || s.waitingBy[client] >= maxWaitersPerClient {
+		return nil, errTooManyWaiters
 	}
-	return d
+	s.waiting++
+	s.waitingBy[client]++
+	return func() {
+		s.waitMu.Lock()
+		defer s.waitMu.Unlock()
+		s.waiting--
+		if s.waitingBy[client]--; s.waitingBy[client] <= 0 {
+			delete(s.waitingBy, client)
+		}
+	}, nil
+}
+
+// startArtifactRead reserves an artifact download slot.
+func (s *Server) startArtifactRead() (func(), error) {
+	select {
+	case s.artifactReads <- struct{}{}:
+		return func() { <-s.artifactReads }, nil
+	default:
+		return nil, errArtifactsBusy
+	}
+}
+
+// startUpload waits for an upload slot and sets the body read deadline.
+// The returned func releases the slot.
+func (s *Server) startUpload(w http.ResponseWriter, r *http.Request) (func(), error) {
+	select {
+	case s.uploads <- struct{}{}:
+	case <-r.Context().Done():
+		return nil, r.Context().Err()
+	}
+	http.NewResponseController(w).SetReadDeadline(time.Now().Add(uploadTimeout))
+	return func() { <-s.uploads }, nil
+}
+
+// bodyError explains a failure to read a request body.
+func bodyError(err error) error {
+	var mbe *http.MaxBytesError
+	if errors.As(err, &mbe) {
+		return errBodyTooLarge
+	}
+	return invalidf("reading request body: %v", err)
+}
+
+// readMCPBody reads an MCP request body into memory (the MCP SDK decodes it
+// in memory anyway) within the upload deadline. Bodies over smallMCPBody
+// hold an upload slot until the returned func is called, since the SDK keeps
+// the decoded arguments for the whole tool call.
+func (s *Server) readMCPBody(w http.ResponseWriter, r *http.Request) (func(), error) {
+	release := func() {}
+	if r.ContentLength < 0 || r.ContentLength > smallMCPBody {
+		var err error
+		if release, err = s.startUpload(w, r); err != nil {
+			return nil, err
+		}
+	} else {
+		http.NewResponseController(w).SetReadDeadline(time.Now().Add(uploadTimeout))
+	}
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
+	http.NewResponseController(w).SetReadDeadline(time.Time{})
+	if err != nil {
+		release()
+		return nil, bodyError(err)
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	return release, nil
 }
 
 func resultCode(r build.Result) int {
@@ -213,93 +325,130 @@ type createRequest struct {
 }
 
 func (s *Server) handleCreate(w http.ResponseWriter, r *http.Request) {
-	client := s.clientIP(r)
-	if !s.limiter.allow(client) {
-		w.Header().Set("Retry-After", "10")
-		writeError(w, http.StatusTooManyRequests, "too many build submissions; slow down")
-		return
-	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, s.maxBody()))
+	client := s.clientKey(r)
+	id, wait, done, err := s.create(w, r, client)
 	if err != nil {
-		writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("request body too large or unreadable (upload limit %d MB)", s.opts.MaxUploadBytes>>20))
+		writeError(w, err)
 		return
 	}
-	var req createRequest
-	ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
-	isGzip := len(body) >= 2 && body[0] == 0x1f && body[1] == 0x8b
-	switch {
-	case ct == "application/json" || (!isGzip && bytes.HasPrefix(bytes.TrimSpace(body), []byte("{"))):
-		dec := json.NewDecoder(bytes.NewReader(body))
-		dec.DisallowUnknownFields()
-		if err := dec.Decode(&req); err != nil {
-			writeError(w, http.StatusBadRequest, "invalid JSON body: "+err.Error())
-			return
-		}
-	case isGzip:
-		if int64(len(body)) > s.opts.MaxUploadBytes {
-			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("tarball exceeds the upload limit of %d MB", s.opts.MaxUploadBytes>>20))
-			return
-		}
-		q := r.URL.Query()
-		req.Image = q.Get("image")
-		req.Toolchain = q.Get("toolchain")
-		req.Command = q.Get("command")
-		req.Artifacts = q["artifact"]
-		for _, a := range strings.Split(q.Get("artifacts"), ",") {
-			if a = strings.TrimSpace(a); a != "" {
-				req.Artifacts = append(req.Artifacts, a)
-			}
-		}
-		if v := q.Get("timeout_seconds"); v != "" {
-			if req.TimeoutSeconds, err = strconv.Atoi(v); err != nil {
-				writeError(w, http.StatusBadRequest, "timeout_seconds must be a number")
-				return
-			}
-		}
-		if v := q.Get("wait_seconds"); v != "" {
-			n, err := strconv.Atoi(v)
-			if err != nil {
-				writeError(w, http.StatusBadRequest, "wait_seconds must be a number")
-				return
-			}
-			req.WaitSeconds = &n
-		}
-		req.Source = body
-	default:
-		writeError(w, http.StatusBadRequest, "send a JSON body (Content-Type: application/json) or a gzipped tarball with query parameters; see "+s.baseURL(r)+"/llms.txt")
-		return
-	}
-
-	wait := s.opts.DefaultWait
-	if req.WaitSeconds != nil {
-		if *req.WaitSeconds < 0 {
-			writeError(w, http.StatusBadRequest, "wait_seconds must be non-negative")
-			return
-		}
-		wait = min(time.Duration(*req.WaitSeconds)*time.Second, s.opts.MaxWait)
-	}
-	req.Client = client
-	res, err := s.svc.Build(r.Context(), req.Request, wait)
+	defer done()
+	res, err := s.svc.Get(r.Context(), id, wait)
 	if err != nil {
-		writeServiceError(w, err)
+		writeError(w, err)
 		return
 	}
 	writeJSON(w, resultCode(res), decorate(res, s.baseURL(r)))
 }
 
-func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
-	v := r.URL.Query().Get("wait")
-	if v == "" {
-		v = r.URL.Query().Get("wait_seconds")
-	}
-	wait, err := parseWait(v, 0, s.opts.MaxWait)
+// create reads a build request, spooling the body to a file while holding an
+// upload slot, and submits it. On success the caller must call done, which
+// releases its waiter slot.
+func (s *Server) create(w http.ResponseWriter, r *http.Request, client string) (id string, wait time.Duration, done func(), err error) {
+	release, err := s.startUpload(w, r)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		return "", 0, nil, err
+	}
+	defer release()
+	f, err := s.svc.NewUploadFile()
+	if err != nil {
+		return "", 0, nil, err
+	}
+	defer os.Remove(f.Name()) // a no-op once Submit has taken it
+	defer f.Close()
+	_, err = io.Copy(f, http.MaxBytesReader(w, r.Body, maxBody))
+	http.NewResponseController(w).SetReadDeadline(time.Time{})
+	if err != nil {
+		return "", 0, nil, bodyError(err)
+	}
+
+	var req createRequest
+	var magic [2]byte
+	n, _ := f.ReadAt(magic[:], 0)
+	ct, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if n == 2 && magic == [2]byte{0x1f, 0x8b} && ct != "application/json" {
+		if err := queryRequest(r.URL.Query(), &req); err != nil {
+			return "", 0, nil, err
+		}
+		req.SourceFile = f.Name()
+	} else {
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return "", 0, nil, err
+		}
+		dec := json.NewDecoder(f)
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&req); err != nil {
+			return "", 0, nil, invalidf("invalid JSON body: %v (send JSON, or a gzipped tarball with query parameters; see %s/llms.txt)", err, s.baseURL(r))
+		}
+	}
+
+	if wait, err = waitFor(req.WaitSeconds, defaultBuildWait, maxWait); err != nil {
+		return "", 0, nil, err
+	}
+	if done, err = s.startWait(client, wait); err != nil {
+		return "", 0, nil, err
+	}
+	req.Client = client
+	if id, err = s.svc.Submit(req.Request); err != nil {
+		done()
+		return "", 0, nil, err
+	}
+	return id, wait, done, nil
+}
+
+// queryRequest fills req from the query parameters of a tarball upload.
+func queryRequest(q url.Values, req *createRequest) error {
+	req.Image = q.Get("image")
+	req.Toolchain = q.Get("toolchain")
+	req.Command = q.Get("command")
+	req.Artifacts = q["artifact"]
+	for _, a := range strings.Split(q.Get("artifacts"), ",") {
+		if a = strings.TrimSpace(a); a != "" {
+			req.Artifacts = append(req.Artifacts, a)
+		}
+	}
+	timeout, err := queryInt(q, "timeout_seconds")
+	if err != nil {
+		return err
+	}
+	if timeout != nil {
+		req.TimeoutSeconds = *timeout
+	}
+	req.WaitSeconds, err = queryInt(q, "wait_seconds")
+	return err
+}
+
+func queryInt(q url.Values, name string) (*int, error) {
+	v := q.Get(name)
+	if v == "" {
+		return nil, nil
+	}
+	n, err := strconv.Atoi(v)
+	if err != nil {
+		return nil, invalidf("%s must be a whole number", name)
+	}
+	return &n, nil
+}
+
+func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
+	n, err := queryInt(r.URL.Query(), "wait_seconds")
+	if err != nil {
+		writeError(w, err)
 		return
 	}
+	wait, err := waitFor(n, 0, maxWait)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	done, err := s.startWait(s.clientKey(r), wait)
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	defer done()
 	res, err := s.svc.Get(r.Context(), r.PathValue("id"), wait)
 	if err != nil {
-		writeServiceError(w, err)
+		writeError(w, err)
 		return
 	}
 	writeJSON(w, resultCode(res), decorate(res, s.baseURL(r)))
@@ -308,12 +457,12 @@ func (s *Server) handleGet(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleLog(w http.ResponseWriter, r *http.Request) {
 	p, err := s.svc.LogPath(r.PathValue("id"))
 	if err != nil {
-		writeServiceError(w, err)
+		writeError(w, err)
 		return
 	}
 	f, err := os.Open(p)
 	if err != nil {
-		writeServiceError(w, build.ErrNotFound)
+		writeError(w, build.ErrNotFound)
 		return
 	}
 	defer f.Close()
@@ -325,23 +474,31 @@ func (s *Server) handleLog(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleArtifactsTar(w http.ResponseWriter, r *http.Request) {
 	p, err := s.svc.ArtifactsPath(r.PathValue("id"))
 	if err != nil {
-		writeError(w, http.StatusNotFound, "no artifacts (the build is unknown, still running, or matched no artifact patterns)")
+		writeError(w, err)
 		return
 	}
+	done, err := s.startArtifactRead()
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	defer done()
 	w.Header().Set("Content-Type", "application/gzip")
 	w.Header().Set("Content-Disposition", `attachment; filename="artifacts.tar.gz"`)
 	http.ServeFile(w, r, p)
 }
 
 func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
+	done, err := s.startArtifactRead()
+	if err != nil {
+		writeError(w, err)
+		return
+	}
+	defer done()
 	name := r.PathValue("path")
 	rc, size, err := s.svc.OpenArtifact(r.PathValue("id"), name)
 	if err != nil {
-		if errors.Is(err, build.ErrNotFound) {
-			writeError(w, http.StatusNotFound, fmt.Sprintf("artifact %q not found; the build result lists available artifacts", name))
-			return
-		}
-		writeServiceError(w, err)
+		writeError(w, err)
 		return
 	}
 	defer rc.Close()

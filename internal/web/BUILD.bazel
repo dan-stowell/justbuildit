@@ -5,7 +5,6 @@ go_library(
     srcs = [
         "guide.go",
         "mcp.go",
-        "ratelimit.go",
         "web.go",
     ],
     importpath = "github.com/dan-stowell/justbuildit/internal/web",
@@ -13,7 +12,6 @@ go_library(
     deps = [
         "//internal/build",
         "@com_github_modelcontextprotocol_go_sdk//mcp",
-        "@org_golang_x_time//rate",
     ],
 )
 

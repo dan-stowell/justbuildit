@@ -6,7 +6,6 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/dan-stowell/justbuildit/internal/build"
 	"github.com/dan-stowell/justbuildit/internal/fakerun"
@@ -78,10 +77,10 @@ func TestMCPBuildRoundTrip(t *testing.T) {
 	r := call(t, cs, "build", map[string]any{
 		"command":   "make",
 		"toolchain": "python",
-		"files":     map[string]any{"out/report.txt": "all good\n", "main.py": "print(1)"},
+		"files":     map[string]any{"out/report.txt": "all good\n", "out/a b#.txt": "x", "main.py": "print(1)"},
 		"artifacts": []string{"out/*"},
 	}, &res)
-	if r.IsError || res.Status != build.StatusSucceeded || res.Image != "python:3.13" || len(res.Artifacts) != 1 {
+	if r.IsError || res.Status != build.StatusSucceeded || res.Image != "python:3.13" || len(res.Artifacts) != 2 {
 		t.Fatalf("build: %+v %+v", r, res)
 	}
 	if !strings.HasPrefix(res.LogURL, url+"/v1/builds/") {
@@ -100,6 +99,11 @@ func TestMCPBuildRoundTrip(t *testing.T) {
 		t.Errorf("read_artifact = %+v", art)
 	}
 
+	call(t, cs, "read_artifact", map[string]any{"id": res.ID, "path": "out/a b#.txt"}, &art)
+	if want := url + "/v1/builds/" + res.ID + "/artifacts/out/a%20b%23.txt"; art.URL != want {
+		t.Errorf("read_artifact url = %q, want %q", art.URL, want)
+	}
+
 	if r := call(t, cs, "read_artifact", map[string]any{"id": res.ID, "path": "main.py"}, nil); !r.IsError {
 		t.Errorf("read_artifact of a path not in the tarball: want tool error, got %+v", r)
 	}
@@ -109,9 +113,9 @@ func TestMCPBuildRoundTrip(t *testing.T) {
 }
 
 func TestMCPBuildStillRunning(t *testing.T) {
-	cs := connect(t, newMCPServer(t, web.Options{MaxMCPWait: 100 * time.Millisecond}))
+	cs := connect(t, newMCPServer(t, web.Options{}))
 	var res build.Result
-	call(t, cs, "build", map[string]any{"command": "block"}, &res)
+	call(t, cs, "build", map[string]any{"command": "block", "wait_seconds": 0}, &res)
 	if res.Status != build.StatusRunning && res.Status != build.StatusQueued {
 		t.Fatalf("status = %q, want running or queued", res.Status)
 	}

@@ -70,9 +70,13 @@ func TestWaitTimeoutReturnsRunning(t *testing.T) {
 }
 
 func TestSpecResolved(t *testing.T) {
-	var got build.Spec
+	var (
+		got       build.Spec
+		sourceErr error
+	)
 	svc := newService(t, build.Config{Run: func(ctx context.Context, spec build.Spec, log io.Writer) (build.Outcome, error) {
 		got = spec
+		_, sourceErr = os.Stat(spec.SourceFile)
 		return build.Outcome{ExitCode: 3}, nil
 	}})
 	res, err := svc.Build(context.Background(), build.Request{
@@ -88,7 +92,10 @@ func TestSpecResolved(t *testing.T) {
 	if res.Status != build.StatusFailed || *res.ExitCode != 3 {
 		t.Fatalf("got %+v, want failed with exit 3", res)
 	}
-	if got.Image != "golang:1.25" || got.Timeout != 30*time.Second || len(got.Source) == 0 ||
+	if sourceErr != nil {
+		t.Errorf("source file: %v", sourceErr)
+	}
+	if got.Image != "golang:1.25" || got.Timeout != 30*time.Second ||
 		len(got.Artifacts) != 1 || got.Artifacts[0] != "out/*" || got.ID != res.ID {
 		t.Errorf("spec = %+v", got)
 	}
@@ -198,22 +205,22 @@ func TestInvalidRequests(t *testing.T) {
 }
 
 func TestLogCappedTailKept(t *testing.T) {
+	const lines = 1_000_000 // well over MaxLogBytes
 	svc := newService(t, build.Config{
-		MaxLogBytes: 1000,
-		TailLines:   3,
 		Run: func(ctx context.Context, spec build.Spec, log io.Writer) (build.Outcome, error) {
-			for i := 0; i < 500; i++ {
+			for i := 0; i < lines; i++ {
 				fmt.Fprintf(log, "line %d\n", i)
 			}
+			io.WriteString(log, strings.Repeat("x", 1<<20)+"\nlast\n") // one big write
 			return build.Outcome{}, nil
 		},
 	})
-	res, err := svc.Build(context.Background(), build.Request{Command: "x"}, 10*time.Second)
+	res, err := svc.Build(context.Background(), build.Request{Command: "x"}, 30*time.Second)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if want := "line 497\nline 498\nline 499\n"; res.LogTail != want {
-		t.Errorf("tail = %q, want %q", res.LogTail, want)
+	if !strings.HasSuffix(res.LogTail, "x\nlast\n") || len(res.LogTail) > 64<<10 {
+		t.Errorf("tail is %d bytes ending %q", len(res.LogTail), res.LogTail[max(0, len(res.LogTail)-20):])
 	}
 	p, err := svc.LogPath(res.ID)
 	if err != nil {
@@ -223,7 +230,7 @@ func TestLogCappedTailKept(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(data) > 1200 || !strings.Contains(string(data), "truncated") {
+	if len(data) > build.MaxLogBytes+200 || !strings.Contains(string(data), "truncated") {
 		t.Errorf("log is %d bytes, truncated notice present: %v", len(data), strings.Contains(string(data), "truncated"))
 	}
 }
@@ -258,5 +265,39 @@ func TestGetUnknown(t *testing.T) {
 		if _, err := svc.Get(context.Background(), id, 0); !errors.Is(err, build.ErrNotFound) {
 			t.Errorf("Get(%q): err = %v, want ErrNotFound", id, err)
 		}
+	}
+}
+
+func TestRunnerPanicReleasesSlots(t *testing.T) {
+	svc := newService(t, build.Config{MaxConcurrent: 1, MaxPerClient: 1, Run: func(ctx context.Context, spec build.Spec, log io.Writer) (build.Outcome, error) {
+		if spec.Command == "panic" {
+			panic("boom")
+		}
+		return build.Outcome{}, nil
+	}})
+	res, err := svc.Build(context.Background(), build.Request{Command: "panic", Client: "a"}, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != build.StatusError || !strings.Contains(res.Error, "boom") {
+		t.Fatalf("got %+v, want error status mentioning the panic", res)
+	}
+	// The concurrency slot and the client's count must have been released.
+	res, err = svc.Build(context.Background(), build.Request{Command: "ok", Client: "a"}, 10*time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Status != build.StatusSucceeded {
+		t.Fatalf("build after panic: %+v", res)
+	}
+}
+
+func TestCommandTooLong(t *testing.T) {
+	svc := newService(t, build.Config{Run: func(context.Context, build.Spec, io.Writer) (build.Outcome, error) {
+		return build.Outcome{}, nil
+	}})
+	var inv *build.InvalidError
+	if _, err := svc.Submit(build.Request{Command: strings.Repeat("x", 1<<20)}); !errors.As(err, &inv) {
+		t.Errorf("1MB command: err = %v, want InvalidError", err)
 	}
 }

@@ -24,17 +24,28 @@ type logWriter struct {
 }
 
 func newLogWriter(w io.Writer, limit int64) *logWriter {
-	return &logWriter{w: w, limit: limit}
+	return &logWriter{w: w, limit: limit, tail: make([]byte, 0, 2*tailBytes)}
+}
+
+// keep appends p to the tail buffer, which never grows past 2*tailBytes:
+// when full, its last tailBytes are copied to the front.
+func (l *logWriter) keep(p []byte) {
+	if len(p) >= tailBytes {
+		p = p[len(p)-tailBytes:]
+		l.tail = l.tail[:0]
+	}
+	if len(l.tail)+len(p) > cap(l.tail) {
+		n := tailBytes - len(p)
+		l.tail = l.tail[:copy(l.tail, l.tail[len(l.tail)-n:])]
+	}
+	l.tail = append(l.tail, p...)
 }
 
 func (l *logWriter) Write(p []byte) (int, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	l.tail = append(l.tail, p...)
-	if len(l.tail) > 2*tailBytes {
-		l.tail = append(l.tail[:0], l.tail[len(l.tail)-tailBytes:]...)
-	}
+	l.keep(p)
 
 	if l.err != nil || l.truncated {
 		return len(p), nil

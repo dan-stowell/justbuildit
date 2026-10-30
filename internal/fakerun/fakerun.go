@@ -3,7 +3,6 @@ package fakerun
 
 import (
 	"archive/tar"
-	"bytes"
 	"compress/gzip"
 	"context"
 	"fmt"
@@ -28,7 +27,7 @@ func New(release <-chan struct{}) build.RunFunc {
 				return build.Outcome{}, ctx.Err()
 			}
 		}
-		if len(spec.Source) == 0 {
+		if spec.SourceFile == "" {
 			return build.Outcome{}, nil
 		}
 		return build.Outcome{}, copyOut(spec)
@@ -36,7 +35,12 @@ func New(release <-chan struct{}) build.RunFunc {
 }
 
 func copyOut(spec build.Spec) error {
-	gr, err := gzip.NewReader(bytes.NewReader(spec.Source))
+	src, err := os.Open(spec.SourceFile)
+	if err != nil {
+		return err
+	}
+	defer src.Close()
+	gr, err := gzip.NewReader(src)
 	if err != nil {
 		return err
 	}

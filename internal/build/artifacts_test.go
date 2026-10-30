@@ -97,15 +97,15 @@ func TestOpenArtifact(t *testing.T) {
 		}
 	}
 	for _, name := range []string{"out/missing", "out/link", "out", "../evil", "/etc/passwd", ""} {
-		if rc, _, err := build.OpenArtifact(p, name); !errors.Is(err, build.ErrNotFound) {
+		if rc, _, err := build.OpenArtifact(p, name); !errors.Is(err, build.ErrArtifactNotFound) {
 			if rc != nil {
 				rc.Close()
 			}
-			t.Errorf("OpenArtifact(%q): err = %v, want ErrNotFound", name, err)
+			t.Errorf("OpenArtifact(%q): err = %v, want ErrArtifactNotFound", name, err)
 		}
 	}
-	if _, _, err := build.OpenArtifact(filepath.Join(t.TempDir(), "none.tar.gz"), "x"); !errors.Is(err, build.ErrNotFound) {
-		t.Errorf("missing tarball: err = %v, want ErrNotFound", err)
+	if _, _, err := build.OpenArtifact(filepath.Join(t.TempDir(), "none.tar.gz"), "x"); !errors.Is(err, build.ErrArtifactNotFound) {
+		t.Errorf("missing tarball: err = %v, want ErrArtifactNotFound", err)
 	}
 }
 
@@ -134,7 +134,7 @@ func TestServiceArtifacts(t *testing.T) {
 	if string(data) != "hello notes\n" {
 		t.Errorf("artifact = %q", data)
 	}
-	if _, _, err := svc.OpenArtifact(res.ID, "out/missing"); !errors.Is(err, build.ErrNotFound) {
-		t.Errorf("missing artifact: err = %v, want ErrNotFound", err)
+	if _, _, err := svc.OpenArtifact(res.ID, "out/missing"); !errors.Is(err, build.ErrArtifactNotFound) {
+		t.Errorf("missing artifact: err = %v, want ErrArtifactNotFound", err)
 	}
 }

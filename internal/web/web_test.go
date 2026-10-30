@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/dan-stowell/justbuildit/internal/build"
 	"github.com/dan-stowell/justbuildit/internal/fakerun"
@@ -97,11 +98,11 @@ func TestBuildAndArtifacts(t *testing.T) {
 
 func TestTarballUpload(t *testing.T) {
 	e := newEnv(t, build.Config{}, web.Options{})
-	src, err := build.TarFromFiles(map[string]string{"out/x": "xx"}, nil)
-	if err != nil {
+	var src bytes.Buffer
+	if err := build.TarFromFiles(&src, map[string]string{"out/x": "xx"}, nil); err != nil {
 		t.Fatal(err)
 	}
-	resp, err := http.Post(e.srv.URL+"/v1/builds?command=make&toolchain=go&artifact=out/*", "application/gzip", bytes.NewReader(src))
+	resp, err := http.Post(e.srv.URL+"/v1/builds?command=make&toolchain=go&artifact=out/*", "application/gzip", &src)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -123,9 +124,9 @@ func TestWaitReturnsRunning(t *testing.T) {
 	if _, ok := res["exit_code"]; ok {
 		t.Errorf("exit_code present on unfinished build")
 	}
-	code, body := get(t, e.srv.URL+"/v1/builds/"+res["id"].(string)+"?wait=1")
+	code, body := get(t, e.srv.URL+"/v1/builds/"+res["id"].(string)+"?wait_seconds=1")
 	if code != http.StatusAccepted || !strings.Contains(body, `"running"`) {
-		t.Errorf("GET wait=1 = %d %s, want 202 running", code, body)
+		t.Errorf("GET wait_seconds=1 = %d %s, want 202 running", code, body)
 	}
 }
 
@@ -160,41 +161,31 @@ func TestQueueFull(t *testing.T) {
 	}
 }
 
+func (e *env) postFrom(t *testing.T, ip string) int {
+	t.Helper()
+	req, _ := http.NewRequest("POST", e.srv.URL+"/v1/builds", strings.NewReader(`{"command": "block", "wait_seconds": 0}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Forwarded-For", "9.9.9.9, "+ip) // last entry is the trusted one
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+	return resp.StatusCode
+}
+
 func TestPerClientCap(t *testing.T) {
 	e := newEnv(t, build.Config{MaxPerClient: 2}, web.Options{ClientIPHeader: "X-Forwarded-For"})
-	post := func(ip string) int {
-		req, _ := http.NewRequest("POST", e.srv.URL+"/v1/builds", strings.NewReader(`{"command": "block", "wait_seconds": 0}`))
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("X-Forwarded-For", "9.9.9.9, "+ip) // last entry is the trusted one
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		resp.Body.Close()
-		return resp.StatusCode
-	}
 	for i := 0; i < 2; i++ {
-		if code := post("10.0.0.1"); code != http.StatusAccepted {
+		if code := e.postFrom(t, "10.0.0.1"); code != http.StatusAccepted {
 			t.Fatalf("build %d: status %d", i, code)
 		}
 	}
-	if code := post("10.0.0.1"); code != http.StatusTooManyRequests {
+	if code := e.postFrom(t, "10.0.0.1"); code != http.StatusTooManyRequests {
 		t.Errorf("third build from same IP: status %d, want 429", code)
 	}
-	if code := post("10.0.0.2"); code != http.StatusAccepted {
+	if code := e.postFrom(t, "10.0.0.2"); code != http.StatusAccepted {
 		t.Errorf("other IP: status %d, want 202", code)
-	}
-}
-
-func TestSubmitRateLimit(t *testing.T) {
-	e := newEnv(t, build.Config{}, web.Options{SubmitBurst: 2, SubmitRate: 0.001})
-	for i := 0; i < 2; i++ {
-		if code, res := e.post(t, `{"command": "true"}`); code != http.StatusOK {
-			t.Fatalf("build %d: %d %v", i, code, res)
-		}
-	}
-	if code, _ := e.post(t, `{"command": "true"}`); code != http.StatusTooManyRequests {
-		t.Errorf("over rate: status %d, want 429", code)
 	}
 }
 
@@ -208,5 +199,64 @@ func TestGuide(t *testing.T) {
 	}
 	if code, _ := get(t, e.srv.URL+"/nope"); code != http.StatusNotFound {
 		t.Errorf("GET /nope = %d, want 404", code)
+	}
+}
+
+func TestIPv6ClientsKeyedBy64(t *testing.T) {
+	e := newEnv(t, build.Config{MaxPerClient: 2}, web.Options{ClientIPHeader: "X-Forwarded-For"})
+	for _, ip := range []string{"2001:db8::1", "2001:db8::2:3"} {
+		if code := e.postFrom(t, ip); code != http.StatusAccepted {
+			t.Fatalf("%s: status %d", ip, code)
+		}
+	}
+	if code := e.postFrom(t, "2001:db8::ffff"); code != http.StatusTooManyRequests {
+		t.Errorf("third build from the same /64: status %d, want 429", code)
+	}
+	if code := e.postFrom(t, "2001:db8:0:1::1"); code != http.StatusAccepted {
+		t.Errorf("other /64: status %d, want 202", code)
+	}
+}
+
+func TestWaiterCap(t *testing.T) {
+	e := newEnv(t, build.Config{}, web.Options{})
+	_, res := e.post(t, `{"command": "block", "wait_seconds": 0}`)
+	url := e.srv.URL + "/v1/builds/" + res["id"].(string) + "?wait_seconds="
+	for i := 0; i < 16; i++ {
+		// Each holds a waiter slot until the build is released at cleanup,
+		// retrying if a probe below briefly holds the slot it needs.
+		go func() {
+			for {
+				resp, err := http.Get(url + "60")
+				if err != nil {
+					return
+				}
+				resp.Body.Close()
+				if resp.StatusCode != http.StatusTooManyRequests {
+					return
+				}
+			}
+		}()
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		code, _ := get(t, url+"1")
+		if code == http.StatusTooManyRequests {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("waiter over the per-client cap: status %d, want 429", code)
+		}
+	}
+	if code, _ := get(t, url+"0"); code != http.StatusAccepted {
+		t.Errorf("non-waiting GET: status %d, want 202", code)
+	}
+}
+
+func TestArtifactURLEscaped(t *testing.T) {
+	e := newEnv(t, build.Config{}, web.Options{})
+	_, res := e.post(t, `{"command": "make", "files": {"out/a b#1?.txt": "hi"}, "artifacts": ["out/*"]}`)
+	id := res["id"].(string)
+	if code, body := get(t, e.srv.URL+"/v1/builds/"+id+"/artifacts/out/a%20b%231%3F.txt"); code != 200 || body != "hi" {
+		t.Errorf("escaped artifact URL = %d %q", code, body)
 	}
 }

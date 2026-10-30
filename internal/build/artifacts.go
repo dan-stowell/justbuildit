@@ -65,16 +65,16 @@ func ListArtifacts(tarPath string) ([]Artifact, error) {
 }
 
 // OpenArtifact returns a reader for one regular file inside a gzipped tar,
-// streamed from the tarball. It returns ErrNotFound if the tarball or the
+// streamed from the tarball. It returns ErrArtifactNotFound if the tarball or the
 // entry does not exist.
 func OpenArtifact(tarPath, name string) (io.ReadCloser, int64, error) {
 	want, err := CleanPath(strings.TrimPrefix(name, "./"))
 	if err != nil {
-		return nil, 0, ErrNotFound
+		return nil, 0, ErrArtifactNotFound
 	}
 	f, err := os.Open(tarPath)
 	if errors.Is(err, os.ErrNotExist) {
-		return nil, 0, ErrNotFound
+		return nil, 0, ErrArtifactNotFound
 	}
 	if err != nil {
 		return nil, 0, err
@@ -89,7 +89,7 @@ func OpenArtifact(tarPath, name string) (io.ReadCloser, int64, error) {
 		h, err := tr.Next()
 		if err == io.EOF {
 			f.Close()
-			return nil, 0, ErrNotFound
+			return nil, 0, ErrArtifactNotFound
 		}
 		if err != nil {
 			f.Close()

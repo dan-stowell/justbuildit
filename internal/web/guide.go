@@ -46,10 +46,10 @@ The response is JSON:
       "artifacts_url": "{{BASE}}/v1/builds/3f0c.../artifacts.tar.gz"
     }
 
-POST waits up to wait_seconds (default 45, max 600) for the build to finish.
-If status is still "queued" or "running" (HTTP 202), poll:
+POST waits up to wait_seconds (default {{WAIT}}, max {{MAXWAIT}}) for the build to
+finish. If status is still "queued" or "running" (HTTP 202), poll:
 
-    curl -sS '{{BASE}}/v1/builds/ID?wait=60'
+    curl -sS '{{BASE}}/v1/builds/ID?wait_seconds=60'
 
 ## Request fields (POST /v1/builds, JSON)
 
@@ -61,10 +61,11 @@ If status is still "queued" or "running" (HTTP 202), poll:
     files            {"relative/path": "text content", ...}
     files_base64     {"relative/path": "base64 content", ...} for binary files.
                      Paths must be relative and must not contain "..".
+                     At most {{MAXFILES}} files, {{UPLOAD}} MB decoded in total.
     artifacts        glob patterns relative to /work of files to keep, e.g.
                      ["out/*", "target/release/app"].
     timeout_seconds  default {{TIMEOUT}}, max {{MAXTIMEOUT}}.
-    wait_seconds     default 45, max 600.
+    wait_seconds     default {{WAIT}}, max {{MAXWAIT}}.
 
 Larger workspaces: send a gzipped tarball as the body instead, with the other
 fields as query parameters (repeat artifact= for several patterns):
@@ -72,11 +73,11 @@ fields as query parameters (repeat artifact= for several patterns):
     tar czf - . | curl -sS --data-binary @- -H 'Content-Type: application/gzip' \
       '{{BASE}}/v1/builds?toolchain=node&command=npm%20ci%20%26%26%20npm%20test&artifact=dist/*'
 
-Uploads are limited to {{UPLOAD}} MB.
+The tarball is limited to {{UPLOAD}} MB.
 
 ## Other endpoints
 
-    GET {{BASE}}/v1/builds/ID?wait=N              build status (waits up to N s)
+    GET {{BASE}}/v1/builds/ID?wait_seconds=N      build status (waits up to N s)
     GET {{BASE}}/v1/builds/ID/log                 full log (text, capped at {{LOG}} MB)
     GET {{BASE}}/v1/builds/ID/artifacts.tar.gz    all artifacts
     GET {{BASE}}/v1/builds/ID/artifacts/PATH      one artifact, e.g. .../artifacts/out/hello
@@ -88,9 +89,9 @@ Uploads are limited to {{UPLOAD}} MB.
 
 Streamable HTTP MCP server at {{BASE}}/mcp with tools:
 
-    build          same fields as the JSON request above; waits up to 50 s
-    get_build      {"id": ..., "wait_seconds": N} (max 50)
-    read_artifact  {"id": ..., "path": ...}; text up to 256KB inline, else a URL
+    build          same fields as the JSON request above; waits up to {{MCPWAIT}} s
+    get_build      {"id": ..., "wait_seconds": N} (max {{MCPWAIT}})
+    read_artifact  {"id": ..., "path": ...}; text up to {{INLINE}} KB inline, else a URL
 
 For Claude Code:
 
@@ -103,7 +104,9 @@ For Claude Code:
 - At most {{PERCLIENT}} builds queued or running per client; more get HTTP 429
   (retry after the Retry-After header). The service also returns 429 when
   its queue is full.
-- Builds and their logs and artifacts are deleted after {{RETENTION}}.
+- Artifacts may total {{ARTIFACTS}} MB compressed; more is a build error.
+- Builds and their logs and artifacts are deleted after {{RETENTION}}, or
+  sooner when many builds have finished since.
 
 ## Tips
 
@@ -122,13 +125,19 @@ func (s *Server) handleGuide(w http.ResponseWriter, r *http.Request) {
 	}
 	text := strings.NewReplacer(
 		"{{BASE}}", s.baseURL(r),
-		"{{TAIL}}", fmt.Sprint(cfg.TailLines),
+		"{{TAIL}}", fmt.Sprint(build.TailLines),
 		"{{DEFAULT}}", build.DefaultImage,
-		"{{UPLOAD}}", fmt.Sprint(s.opts.MaxUploadBytes>>20),
-		"{{LOG}}", fmt.Sprint(cfg.MaxLogBytes>>20),
+		"{{UPLOAD}}", fmt.Sprint(build.MaxSourceBytes>>20),
+		"{{MAXFILES}}", fmt.Sprint(build.MaxSourceFiles),
+		"{{LOG}}", fmt.Sprint(build.MaxLogBytes>>20),
+		"{{ARTIFACTS}}", fmt.Sprint(build.MaxArtifactsBytes>>20),
+		"{{WAIT}}", fmt.Sprint(int(defaultBuildWait.Seconds())),
+		"{{MAXWAIT}}", fmt.Sprint(int(maxWait.Seconds())),
+		"{{MCPWAIT}}", fmt.Sprint(int(maxMCPWait.Seconds())),
+		"{{INLINE}}", fmt.Sprint(maxInlineArtifact>>10),
 		"{{TOOLCHAINS}}", tc.String(),
 		"{{PERCLIENT}}", fmt.Sprint(cfg.MaxPerClient),
-		"{{TIMEOUT}}", fmt.Sprint(int(cfg.DefaultTimeout.Seconds())),
+		"{{TIMEOUT}}", fmt.Sprint(int(s.svc.DefaultTimeout().Seconds())),
 		"{{MAXTIMEOUT}}", fmt.Sprint(int(cfg.MaxTimeout.Seconds())),
 		"{{RETENTION}}", cfg.Retention.String(),
 	).Replace(guideTemplate)
