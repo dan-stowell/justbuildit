@@ -1,0 +1,18 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "docker",
+    srcs = ["docker.go"],
+    importpath = "github.com/dan-stowell/justbuildit/internal/docker",
+    visibility = ["//:__subpackages__"],
+    deps = ["//internal/build"],
+)
+
+go_test(
+    name = "docker_test",
+    srcs = ["docker_test.go"],
+    deps = [
+        ":docker",
+        "//internal/build",
+    ],
+)

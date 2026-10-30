@@ -1,0 +1,18 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+
+go_library(
+    name = "runnercheck_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/dan-stowell/justbuildit/cmd/runnercheck",
+    visibility = ["//visibility:private"],
+    deps = [
+        "//internal/build",
+        "//internal/docker",
+    ],
+)
+
+go_binary(
+    name = "runnercheck",
+    embed = [":runnercheck_lib"],
+    visibility = ["//visibility:public"],
+)
