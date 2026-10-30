@@ -5,6 +5,10 @@ go_library(
     srcs = ["main.go"],
     importpath = "github.com/dan-stowell/justbuildit/cmd/justbuildit",
     visibility = ["//visibility:private"],
+    deps = [
+        "//internal/build",
+        "//internal/web",
+    ],
 )
 
 go_binary(

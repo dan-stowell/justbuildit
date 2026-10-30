@@ -1,4 +1,5 @@
 load("@gazelle//:def.bzl", "gazelle")
 
 # gazelle:prefix github.com/dan-stowell/justbuildit
+# gazelle:go_test file
 gazelle(name = "gazelle")

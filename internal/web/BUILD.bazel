@@ -1,0 +1,39 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "web",
+    srcs = [
+        "guide.go",
+        "mcp.go",
+        "ratelimit.go",
+        "web.go",
+    ],
+    importpath = "github.com/dan-stowell/justbuildit/internal/web",
+    visibility = ["//:__subpackages__"],
+    deps = [
+        "//internal/build",
+        "@com_github_modelcontextprotocol_go_sdk//mcp",
+        "@org_golang_x_time//rate",
+    ],
+)
+
+go_test(
+    name = "mcp_test",
+    srcs = ["mcp_test.go"],
+    deps = [
+        ":web",
+        "//internal/build",
+        "//internal/fakerun",
+        "@com_github_modelcontextprotocol_go_sdk//mcp",
+    ],
+)
+
+go_test(
+    name = "web_test",
+    srcs = ["web_test.go"],
+    deps = [
+        ":web",
+        "//internal/build",
+        "//internal/fakerun",
+    ],
+)
