@@ -1,0 +1,2 @@
+# Pure Go: no cgo, static binary, and no dependency on the RBE image C toolchain.
+common --@rules_go//go/config:pure

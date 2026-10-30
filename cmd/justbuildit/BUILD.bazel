@@ -1,0 +1,14 @@
+load("@rules_go//go:def.bzl", "go_binary", "go_library")
+
+go_library(
+    name = "justbuildit_lib",
+    srcs = ["main.go"],
+    importpath = "github.com/dan-stowell/justbuildit/cmd/justbuildit",
+    visibility = ["//visibility:private"],
+)
+
+go_binary(
+    name = "justbuildit",
+    embed = [":justbuildit_lib"],
+    visibility = ["//visibility:public"],
+)
