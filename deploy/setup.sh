@@ -26,6 +26,7 @@ IMAGES=(
   rust:1
   gcc:14
   maven:3-eclipse-temurin-21
+  buildpack-deps:bookworm  # build.DefaultImage
 )
 
 if [[ $EUID -ne 0 ]]; then

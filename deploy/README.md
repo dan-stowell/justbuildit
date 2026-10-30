@@ -21,8 +21,9 @@ Chain `JUSTBUILDIT-IN` (the first rule of `INPUT`) drops everything from
 `jbi0` addressed to the host itself. Public internet is allowed. The chains
 are replaced atomically with `iptables-restore --noflush`, so re-running it
 never leaves a gap. `justbuildit-firewall.service` re-applies it at boot and
-whenever Docker starts. The service should call `docker.CheckFirewall` at
-startup and refuse to run builds if it fails (it needs root to read iptables).
+whenever Docker starts. The service checks the rules (`docker.CheckFirewall`)
+at startup and refuses to start if they are missing, unless it is given
+`--insecure-no-firewall` (never do that on a public host).
 
 Images: refs must be on Docker Hub (explicit or implicit), ghcr.io, quay.io,
 gcr.io, mcr.microsoft.com, public.ecr.aws or registry.k8s.io, with no ports
@@ -66,3 +67,30 @@ Bazel invocation ID, then download that invocation's outputs:
 `bb download artifacts` takes the Bazel invocation (the one printed as
 "Invocation ID:" in the output), not the outer `bb remote` run, which has no
 artifacts. The binary is static (pure Go), so it runs as is.
+
+## Installing and updating the service
+
+`deploy/justbuildit.service` runs `/usr/local/bin/justbuildit` as root (it
+runs docker and reads iptables; docker group membership would be
+root-equivalent anyway) on `:8000`, with data in `/var/lib/justbuildit`
+(created by systemd). It starts after Docker and `justbuildit-firewall`,
+restarts on failure, and gets only the environment set in the unit, so
+nothing from an operator's shell (such as `BUILDBUDDY_API_KEY`) reaches it.
+At startup it removes leftover build containers and wipes old build data
+(the build index lives in memory).
+
+First install, after `deploy/setup.sh` and fetching the binary as above:
+
+    sudo install -m 755 out/cmd/justbuildit/justbuildit_/justbuildit /usr/local/bin/
+    sudo install -m 644 deploy/justbuildit.service /etc/systemd/system/
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now justbuildit
+    curl -s http://localhost:8000/llms.txt | head
+
+To redeploy, build and download a new binary as above, then:
+
+    sudo install -m 755 out/cmd/justbuildit/justbuildit_/justbuildit /usr/local/bin/
+    sudo systemctl restart justbuildit
+
+A restart cancels running builds and forgets all builds. Logs:
+`journalctl -u justbuildit`.

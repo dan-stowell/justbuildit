@@ -1,0 +1,22 @@
+[Unit]
+Description=justbuildit build service
+Requires=docker.service justbuildit-firewall.service
+After=network-online.target docker.service justbuildit-firewall.service
+Wants=network-online.target
+
+[Service]
+# Root: the service runs docker and reads iptables (membership in the
+# docker group would be root-equivalent anyway).
+ExecStart=/usr/local/bin/justbuildit -addr=:8000 -data-dir=/var/lib/justbuildit
+StateDirectory=justbuildit
+# Only this environment; drop anything imported into the systemd manager.
+UnsetEnvironment=BUILDBUDDY_API_KEY
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+Environment=HOME=/var/lib/justbuildit
+Environment=LANG=C.UTF-8
+Restart=always
+RestartSec=5
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
