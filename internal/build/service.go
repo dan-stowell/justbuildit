@@ -416,6 +416,10 @@ func (s *Service) run(j *job, spec Spec, logFile *os.File) {
 	var arts []Artifact
 	if runErr == nil {
 		arts, runErr = s.listArtifacts(spec)
+	} else {
+		// A failed or crashed runner may have left a partial or oversized
+		// tarball; an errored build has no artifacts.
+		os.Remove(filepath.Join(spec.Dir, ArtifactsFile))
 	}
 
 	s.mu.Lock()

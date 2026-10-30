@@ -187,7 +187,14 @@ func Run(ctx context.Context, cfg Config, spec build.Spec, log io.Writer) (build
 
 	name := "justbuildit-" + spec.ID
 	cmd := exec.Command(cfg.Docker, runArgs(cfg, spec, name, resolv, volumes)...)
-	cmd.Stdin = bytes.NewReader(spec.Source)
+	if spec.SourceFile != "" {
+		src, err := os.Open(spec.SourceFile)
+		if err != nil {
+			return build.Outcome{}, fmt.Errorf("opening source: %w", err)
+		}
+		defer src.Close()
+		cmd.Stdin = src
+	}
 	cmd.Stderr = log
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -273,7 +280,7 @@ func runArgs(cfg Config, spec build.Spec, name, resolv string, volumes []string)
 	for _, v := range volumes {
 		args = append(args, "--mount", v)
 	}
-	if len(spec.Source) > 0 {
+	if spec.SourceFile != "" {
 		args = append(args, "--env", "JUSTBUILDIT_SOURCE=1")
 	}
 	if cfg.Runtime != "" {

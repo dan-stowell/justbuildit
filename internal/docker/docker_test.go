@@ -301,7 +301,10 @@ func noArtifacts(t *testing.T, dir string) {
 
 func TestRunSourceLogAndArtifacts(t *testing.T) {
 	f := setup(t)
-	f.spec.Source = tarGz(t, map[string]string{"hello.txt": "hi from source\n"})
+	f.spec.SourceFile = filepath.Join(t.TempDir(), "source.tar.gz")
+	if err := os.WriteFile(f.spec.SourceFile, tarGz(t, map[string]string{"hello.txt": "hi from source\n"}), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	f.spec.Command = `cat hello.txt; echo to-stderr >&2; echo bin > out.bin
 mkdir -p d; echo y > d/y; echo s > "my file.txt"; ln -s /etc/passwd link`
 	f.spec.Artifacts = []string{"out.bin", "d", "my*", "link", "nomatch*"}

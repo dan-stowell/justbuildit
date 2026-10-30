@@ -56,7 +56,12 @@ func run(image, command string, src map[string]string, artifacts []string, timeo
 		Dir:       dir,
 	}
 	if src != nil {
-		spec.Source = tarGz(src)
+		// The service keeps the source outside Dir.
+		spec.SourceFile = dir + ".source.tar.gz"
+		if err := os.WriteFile(spec.SourceFile, tarGz(src), 0o644); err != nil {
+			panic(err)
+		}
+		defer os.Remove(spec.SourceFile)
 	}
 	var log bytes.Buffer
 	out, err := docker.Run(context.Background(), cfg, spec, &log)

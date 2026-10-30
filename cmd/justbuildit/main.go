@@ -14,12 +14,15 @@ import (
 	"time"
 
 	"github.com/dan-stowell/justbuildit/internal/build"
+	"github.com/dan-stowell/justbuildit/internal/docker"
 	"github.com/dan-stowell/justbuildit/internal/web"
 )
 
-// run executes builds. Replace with docker.Run once the runner lands.
+var dockerCfg = docker.DefaultConfig()
+
+// run executes builds in gVisor containers.
 var run build.RunFunc = func(ctx context.Context, spec build.Spec, log io.Writer) (build.Outcome, error) {
-	return build.Outcome{}, errors.New("build runner is not configured on this server")
+	return docker.Run(ctx, dockerCfg, spec, log)
 }
 
 func main() {
@@ -33,9 +36,24 @@ func main() {
 		perClient  = flag.Int("max-per-client", 2, "builds queued or running per client IP")
 		maxTimeout = flag.Duration("max-timeout", 30*time.Minute, "maximum build timeout")
 		retention  = flag.Duration("retention", 6*time.Hour, "how long finished builds are kept")
+		noFirewall = flag.Bool("insecure-no-firewall", false, "start even if the build network firewall (deploy/firewall.sh) is missing; builds can then reach private networks and the host")
 	)
 	flag.Parse()
 	logger := slog.New(slog.NewTextHandler(os.Stderr, nil))
+
+	startCtx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	if err := docker.CheckFirewall(startCtx, dockerCfg); err != nil {
+		if !*noFirewall {
+			logger.Error("refusing to start without the build firewall (see deploy/README.md)", "err", err)
+			os.Exit(1)
+		}
+		logger.Warn("starting without the build firewall", "err", err)
+	}
+	if err := docker.Cleanup(startCtx, dockerCfg); err != nil {
+		logger.Error("removing leftover build containers", "err", err)
+		os.Exit(1)
+	}
+	cancel()
 
 	svc, err := build.New(build.Config{
 		DataDir:       *dataDir,

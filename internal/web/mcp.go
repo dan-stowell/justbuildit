@@ -122,7 +122,7 @@ func (s *Server) mcpGetBuild(ctx context.Context, req *mcp.CallToolRequest, args
 }
 
 func (s *Server) mcpReadArtifact(ctx context.Context, req *mcp.CallToolRequest, args ReadArtifactArgs) (*mcp.CallToolResult, ArtifactContent, error) {
-	done, err := s.startArtifactRead()
+	done, err := s.startArtifactRead(nil)
 	if err != nil {
 		return nil, ArtifactContent{}, err
 	}

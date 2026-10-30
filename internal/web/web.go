@@ -37,15 +37,20 @@ const (
 	uploadTimeout = 2 * time.Minute
 	// maxUploads bounds request bodies being read and decoded at once.
 	maxUploads = 8
+	// uploadQueueWait bounds how long a request waits for an upload slot.
+	uploadQueueWait = 5 * time.Second
 	// smallMCPBody is the size up to which an MCP request skips the upload
-	// limit.
+	// limit; maxSmallMCP bounds such requests in flight at once.
 	smallMCPBody = 1 << 20
+	maxSmallMCP  = 128
 
 	// maxWaiters and maxWaitersPerClient bound requests waiting on builds.
 	maxWaiters          = 512
 	maxWaitersPerClient = 16
-	// maxArtifactReads bounds artifact downloads at once.
-	maxArtifactReads = 8
+	// maxArtifactReads bounds artifact downloads at once, and
+	// artifactWriteTimeout how long each may take.
+	maxArtifactReads     = 8
+	artifactWriteTimeout = 10 * time.Minute
 	// maxInlineArtifact is the largest artifact read_artifact returns inline.
 	maxInlineArtifact = 256 << 10
 )
@@ -53,6 +58,7 @@ const (
 var (
 	errTooManyWaiters = errors.New("too many requests are waiting on builds (from this client or overall); retry in a few seconds, or poll with a shorter wait_seconds")
 	errArtifactsBusy  = errors.New("too many artifact downloads in progress; retry in a few seconds")
+	errUploadsBusy    = errors.New("the server is busy receiving other requests; retry in a few seconds")
 	errBodyTooLarge   = fmt.Errorf("request body too large; the workspace may total at most %d MB", build.MaxSourceBytes>>20)
 )
 
@@ -73,6 +79,7 @@ type Server struct {
 	svc           *build.Service
 	mux           *http.ServeMux
 	uploads       chan struct{}
+	smallMCP      chan struct{}
 	artifactReads chan struct{}
 
 	waitMu    sync.Mutex
@@ -95,6 +102,7 @@ func New(opts Options) *Server {
 		svc:           opts.Service,
 		mux:           http.NewServeMux(),
 		uploads:       make(chan struct{}, maxUploads),
+		smallMCP:      make(chan struct{}, maxSmallMCP),
 		artifactReads: make(chan struct{}, maxArtifactReads),
 		waitingBy:     map[string]int{},
 	}
@@ -204,14 +212,19 @@ func errorStatus(err error) int {
 	case errors.Is(err, build.ErrQueueFull), errors.Is(err, build.ErrClientLimit),
 		errors.Is(err, errTooManyWaiters), errors.Is(err, errArtifactsBusy):
 		return http.StatusTooManyRequests
+	case errors.Is(err, errUploadsBusy):
+		return http.StatusServiceUnavailable
 	}
 	return http.StatusInternalServerError
 }
 
 func writeError(w http.ResponseWriter, err error) {
 	code := errorStatus(err)
-	if code == http.StatusTooManyRequests {
+	switch code {
+	case http.StatusTooManyRequests:
 		w.Header().Set("Retry-After", "30")
+	case http.StatusServiceUnavailable:
+		w.Header().Set("Retry-After", "5")
 	}
 	writeJSON(w, code, map[string]string{"error": err.Error()})
 }
@@ -257,21 +270,30 @@ func (s *Server) startWait(client string, wait time.Duration) (func(), error) {
 	}, nil
 }
 
-// startArtifactRead reserves an artifact download slot.
-func (s *Server) startArtifactRead() (func(), error) {
+// startArtifactRead reserves an artifact download slot. If w is not nil it
+// also bounds the response write time, so a slow reader cannot hold the
+// slot forever.
+func (s *Server) startArtifactRead(w http.ResponseWriter) (func(), error) {
 	select {
 	case s.artifactReads <- struct{}{}:
-		return func() { <-s.artifactReads }, nil
 	default:
 		return nil, errArtifactsBusy
 	}
+	if w != nil {
+		http.NewResponseController(w).SetWriteDeadline(time.Now().Add(artifactWriteTimeout))
+	}
+	return func() { <-s.artifactReads }, nil
 }
 
-// startUpload waits for an upload slot and sets the body read deadline.
-// The returned func releases the slot.
+// startUpload waits up to uploadQueueWait for an upload slot and sets the
+// body read deadline. The returned func releases the slot.
 func (s *Server) startUpload(w http.ResponseWriter, r *http.Request) (func(), error) {
+	t := time.NewTimer(uploadQueueWait)
+	defer t.Stop()
 	select {
 	case s.uploads <- struct{}{}:
+	case <-t.C:
+		return nil, errUploadsBusy
 	case <-r.Context().Done():
 		return nil, r.Context().Err()
 	}
@@ -291,18 +313,27 @@ func bodyError(err error) error {
 // readMCPBody reads an MCP request body into memory (the MCP SDK decodes it
 // in memory anyway) within the upload deadline. Bodies over smallMCPBody
 // hold an upload slot until the returned func is called, since the SDK keeps
-// the decoded arguments for the whole tool call.
+// the decoded arguments for the whole tool call; smaller ones hold one of
+// maxSmallMCP slots and are read with a smallMCPBody limit.
 func (s *Server) readMCPBody(w http.ResponseWriter, r *http.Request) (func(), error) {
-	release := func() {}
+	var release func()
+	limit := int64(maxBody)
 	if r.ContentLength < 0 || r.ContentLength > smallMCPBody {
 		var err error
 		if release, err = s.startUpload(w, r); err != nil {
 			return nil, err
 		}
 	} else {
+		select {
+		case s.smallMCP <- struct{}{}:
+		default:
+			return nil, errUploadsBusy
+		}
+		release = func() { <-s.smallMCP }
+		limit = smallMCPBody
 		http.NewResponseController(w).SetReadDeadline(time.Now().Add(uploadTimeout))
 	}
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxBody))
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, limit))
 	http.NewResponseController(w).SetReadDeadline(time.Time{})
 	if err != nil {
 		release()
@@ -477,7 +508,7 @@ func (s *Server) handleArtifactsTar(w http.ResponseWriter, r *http.Request) {
 		writeError(w, err)
 		return
 	}
-	done, err := s.startArtifactRead()
+	done, err := s.startArtifactRead(w)
 	if err != nil {
 		writeError(w, err)
 		return
@@ -489,7 +520,7 @@ func (s *Server) handleArtifactsTar(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleArtifact(w http.ResponseWriter, r *http.Request) {
-	done, err := s.startArtifactRead()
+	done, err := s.startArtifactRead(w)
 	if err != nil {
 		writeError(w, err)
 		return

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -299,5 +300,29 @@ func TestCommandTooLong(t *testing.T) {
 	var inv *build.InvalidError
 	if _, err := svc.Submit(build.Request{Command: strings.Repeat("x", 1<<20)}); !errors.As(err, &inv) {
 		t.Errorf("1MB command: err = %v, want InvalidError", err)
+	}
+}
+
+func TestRunnerErrorDropsArtifacts(t *testing.T) {
+	svc := newService(t, build.Config{Run: func(ctx context.Context, spec build.Spec, log io.Writer) (build.Outcome, error) {
+		if err := os.WriteFile(filepath.Join(spec.Dir, build.ArtifactsFile), []byte("partial"), 0o644); err != nil {
+			return build.Outcome{}, err
+		}
+		if spec.Command == "panic" {
+			panic("boom")
+		}
+		return build.Outcome{}, errors.New("infra failure")
+	}})
+	for _, cmd := range []string{"panic", "fail"} {
+		res, err := svc.Build(context.Background(), build.Request{Command: cmd}, 10*time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if res.Status != build.StatusError {
+			t.Fatalf("%s: status = %s, want error", cmd, res.Status)
+		}
+		if _, err := svc.ArtifactsPath(res.ID); !errors.Is(err, build.ErrArtifactNotFound) {
+			t.Errorf("%s: ArtifactsPath err = %v, want ErrArtifactNotFound", cmd, err)
+		}
 	}
 }
